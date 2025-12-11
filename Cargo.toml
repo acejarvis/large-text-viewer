@@ -2,35 +2,32 @@
 name = "large-text-viewer"
 version = "0.1.0"
 edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
-description = "A high-performance text file viewer for files >10GB"
+authors = ["Jarvis Wang <jarvis.wang@mail.utoronto.ca>"]
+description = "A cross-platform GUI app for viewing and editing multi-GB text files"
 license = "MIT"
 
-[[bin]]
-name = "large-text-viewer"
-path = "src/gui_egui.rs"
-
-[[bin]]
-name = "large-text-cli"
-path = "src/cli.rs"
-
 [dependencies]
-# GUI framework - egui is much better for WSL!
-eframe = "0.29"
-egui = "0.29"
+# GUI framework
+iced = { version = "0.12", features = ["tokio", "advanced"] }
 
 # Memory-mapped file I/O
 memmap2 = "0.9"
 
-# Parallel processing
-rayon = "1.8"
+# Multithreading for search/replace
+rayon = "1.10"
 
-# Regular expressions
+# Regex support for search
 regex = "1.10"
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
 
 # Error handling
 anyhow = "1.0"
 thiserror = "1.0"
+
+# File dialogs
+rfd = "0.14"
 
 [dev-dependencies]
 tempfile = "3.8"

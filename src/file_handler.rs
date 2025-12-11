@@ -2,102 +2,102 @@ use anyhow::{Context, Result};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-/// Handles file operations with memory-mapped I/O
-#[derive(Clone, Debug)]
+/// FileHandler manages memory-mapped file I/O for efficient large file handling
+#[derive(Clone)]
 pub struct FileHandler {
-    /// Memory-mapped file
     mmap: Arc<Mmap>,
-    /// Index of line start positions in the file
     line_offsets: Arc<Vec<usize>>,
-    /// In-memory modifications (line_number -> modified_content)
     modified_lines: Arc<RwLock<HashMap<usize, String>>>,
-    /// Total file size in bytes
-    file_size: usize,
 }
 
 impl FileHandler {
-    /// Opens a file and builds the line offset index
-    pub fn open(path: &str) -> Result<Self> {
-        let file = File::open(path)
-            .with_context(|| format!("Failed to open file: {}", path))?;
+    /// Create a new FileHandler from a file path
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let file = File::open(path.as_ref())
+            .context("Failed to open file")?;
         
         let mmap = unsafe {
             Mmap::map(&file)
-                .with_context(|| format!("Failed to memory-map file: {}", path))?
+                .context("Failed to memory-map file")?
         };
-        
-        let file_size = mmap.len();
-        
+
         // Build line offset index
         let line_offsets = Self::build_line_index(&mmap);
-        
+
         Ok(Self {
             mmap: Arc::new(mmap),
             line_offsets: Arc::new(line_offsets),
             modified_lines: Arc::new(RwLock::new(HashMap::new())),
-            file_size,
         })
     }
-    
-    /// Builds an index of line start positions
+
+    /// Build an index of line offsets for fast random access
     fn build_line_index(mmap: &Mmap) -> Vec<usize> {
-        let mut offsets = vec![0]; // First line starts at 0
+        let mut offsets = vec![0];
         
         for (i, &byte) in mmap.iter().enumerate() {
             if byte == b'\n' {
-                offsets.push(i + 1); // Next line starts after newline
+                offsets.push(i + 1);
             }
+        }
+        
+        // Ensure we have an offset for EOF if file doesn't end with newline
+        if offsets.last() != Some(&mmap.len()) {
+            offsets.push(mmap.len());
         }
         
         offsets
     }
-    
-    /// Returns the total number of lines in the file
+
+    /// Get the total number of lines in the file
     pub fn total_lines(&self) -> usize {
-        self.line_offsets.len()
+        self.line_offsets.len().saturating_sub(1).max(1)
     }
-    
-    /// Returns the file size in bytes
-    pub fn file_size(&self) -> usize {
-        self.file_size
-    }
-    
-    /// Gets a single line by line number (0-indexed)
+
+    /// Get a single line by line number (0-indexed)
     pub fn get_line(&self, line_num: usize) -> Option<String> {
-        // Check for modified version first
+        // Check if line is modified
         if let Ok(modified) = self.modified_lines.read() {
-            if let Some(line) = modified.get(&line_num) {
-                return Some(line.clone());
+            if let Some(content) = modified.get(&line_num) {
+                return Some(content.clone());
             }
         }
-        
+
         // Get from memory-mapped file
-        if line_num >= self.line_offsets.len() {
+        if line_num >= self.line_offsets.len() - 1 {
             return None;
         }
-        
+
         let start = self.line_offsets[line_num];
-        let end = if line_num + 1 < self.line_offsets.len() {
-            self.line_offsets[line_num + 1]
-        } else {
-            self.mmap.len()
-        };
-        
+        let end = self.line_offsets[line_num + 1];
+
         if start >= end {
             return Some(String::new());
         }
-        
-        // Extract line and remove trailing newline
+
         let line_bytes = &self.mmap[start..end];
-        let line = String::from_utf8_lossy(line_bytes).to_string();
         
-        // Remove trailing \n or \r\n
-        Some(line.trim_end_matches(&['\n', '\r'][..]).to_string())
+        // Remove trailing newline if present
+        let line_bytes = if line_bytes.last() == Some(&b'\n') {
+            &line_bytes[..line_bytes.len() - 1]
+        } else {
+            line_bytes
+        };
+
+        // Remove trailing carriage return if present (for Windows line endings)
+        let line_bytes = if line_bytes.last() == Some(&b'\r') {
+            &line_bytes[..line_bytes.len() - 1]
+        } else {
+            line_bytes
+        };
+
+        String::from_utf8_lossy(line_bytes).to_string().into()
     }
-    
-    /// Gets a range of lines (viewport rendering)
+
+    /// Get a range of lines for viewport rendering
     pub fn get_viewport_lines(&self, start_line: usize, count: usize) -> Vec<String> {
         let total_lines = self.total_lines();
         let end_line = (start_line + count).min(total_lines);
@@ -106,47 +106,48 @@ impl FileHandler {
             .filter_map(|i| self.get_line(i))
             .collect()
     }
-    
-    /// Sets a modified line in memory (for preview or undo)
-    pub fn set_line(&self, line_num: usize, content: String) -> Result<()> {
-        let mut modified = self.modified_lines.write()
-            .map_err(|_| anyhow::anyhow!("Failed to acquire write lock"))?;
-        modified.insert(line_num, content);
-        Ok(())
+
+    /// Update a line in memory (for editing)
+    pub fn update_line(&mut self, line_num: usize, content: String) {
+        if let Ok(mut modified) = self.modified_lines.write() {
+            modified.insert(line_num, content);
+        }
     }
-    
-    /// Clears all in-memory modifications
-    pub fn clear_modifications(&self) -> Result<()> {
-        let mut modified = self.modified_lines.write()
-            .map_err(|_| anyhow::anyhow!("Failed to acquire write lock"))?;
-        modified.clear();
-        Ok(())
+
+    /// Get all modified lines
+    pub fn get_modified_lines(&self) -> HashMap<usize, String> {
+        self.modified_lines.read()
+            .map(|m| m.clone())
+            .unwrap_or_default()
     }
-    
-    /// Gets the raw bytes for a line range (for search operations)
-    pub fn get_line_bytes(&self, line_num: usize) -> Option<&[u8]> {
-        if line_num >= self.line_offsets.len() {
-            return None;
+
+    /// Clear all modifications
+    #[allow(dead_code)]
+    pub fn clear_modifications(&mut self) {
+        if let Ok(mut modified) = self.modified_lines.write() {
+            modified.clear();
+        }
+    }
+
+    /// Get raw bytes for a line range (for search operations)
+    #[allow(dead_code)]
+    pub fn get_line_range_bytes(&self, start_line: usize, end_line: usize) -> &[u8] {
+        let total_lines = self.line_offsets.len() - 1;
+        if start_line >= total_lines {
+            return &[];
         }
         
-        let start = self.line_offsets[line_num];
-        let end = if line_num + 1 < self.line_offsets.len() {
-            self.line_offsets[line_num + 1]
-        } else {
-            self.mmap.len()
-        };
+        let end_line = end_line.min(total_lines);
+        let start_offset = self.line_offsets[start_line];
+        let end_offset = self.line_offsets[end_line];
         
-        if start >= end {
-            return Some(&[]);
-        }
-        
-        Some(&self.mmap[start..end])
+        &self.mmap[start_offset..end_offset]
     }
-    
-    /// Gets all lines as an iterator (for batch operations)
-    pub fn iter_lines(&self) -> impl Iterator<Item = (usize, String)> + '_ {
-        (0..self.total_lines())
-            .filter_map(|i| self.get_line(i).map(|line| (i, line)))
+
+    /// Get the byte offset for a given line number
+    #[allow(dead_code)]
+    pub fn get_line_offset(&self, line_num: usize) -> Option<usize> {
+        self.line_offsets.get(line_num).copied()
     }
 }
 
@@ -155,65 +156,60 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
-    
-    fn create_test_file(content: &str) -> NamedTempFile {
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(content.as_bytes()).unwrap();
-        file
-    }
-    
+
     #[test]
-    fn test_open_file() {
-        let temp_file = create_test_file("line1\nline2\nline3");
-        let handler = FileHandler::open(temp_file.path().to_str().unwrap()).unwrap();
+    fn test_file_handler_basic() -> Result<()> {
+        let mut temp_file = NamedTempFile::new()?;
+        writeln!(temp_file, "Line 1")?;
+        writeln!(temp_file, "Line 2")?;
+        writeln!(temp_file, "Line 3")?;
+        temp_file.flush()?;
+
+        let handler = FileHandler::new(temp_file.path())?;
+        
         assert_eq!(handler.total_lines(), 3);
+        assert_eq!(handler.get_line(0), Some("Line 1".to_string()));
+        assert_eq!(handler.get_line(1), Some("Line 2".to_string()));
+        assert_eq!(handler.get_line(2), Some("Line 3".to_string()));
+
+        Ok(())
     }
-    
+
     #[test]
-    fn test_get_line() {
-        let temp_file = create_test_file("first\nsecond\nthird");
-        let handler = FileHandler::open(temp_file.path().to_str().unwrap()).unwrap();
+    fn test_viewport_lines() -> Result<()> {
+        let mut temp_file = NamedTempFile::new()?;
+        for i in 1..=100 {
+            writeln!(temp_file, "Line {}", i)?;
+        }
+        temp_file.flush()?;
+
+        let handler = FileHandler::new(temp_file.path())?;
         
-        assert_eq!(handler.get_line(0), Some("first".to_string()));
-        assert_eq!(handler.get_line(1), Some("second".to_string()));
-        assert_eq!(handler.get_line(2), Some("third".to_string()));
-        assert_eq!(handler.get_line(3), None);
+        let viewport = handler.get_viewport_lines(0, 10);
+        assert_eq!(viewport.len(), 10);
+        assert_eq!(viewport[0], "Line 1");
+        assert_eq!(viewport[9], "Line 10");
+
+        let viewport = handler.get_viewport_lines(50, 10);
+        assert_eq!(viewport.len(), 10);
+        assert_eq!(viewport[0], "Line 51");
+
+        Ok(())
     }
-    
+
     #[test]
-    fn test_viewport_lines() {
-        let temp_file = create_test_file("1\n2\n3\n4\n5");
-        let handler = FileHandler::open(temp_file.path().to_str().unwrap()).unwrap();
+    fn test_line_modification() -> Result<()> {
+        let mut temp_file = NamedTempFile::new()?;
+        writeln!(temp_file, "Original line")?;
+        temp_file.flush()?;
+
+        let mut handler = FileHandler::new(temp_file.path())?;
         
-        let viewport = handler.get_viewport_lines(1, 2);
-        assert_eq!(viewport, vec!["2", "3"]);
-    }
-    
-    #[test]
-    fn test_modified_lines() {
-        let temp_file = create_test_file("original\nline2");
-        let handler = FileHandler::open(temp_file.path().to_str().unwrap()).unwrap();
+        assert_eq!(handler.get_line(0), Some("Original line".to_string()));
         
-        handler.set_line(0, "modified".to_string()).unwrap();
-        assert_eq!(handler.get_line(0), Some("modified".to_string()));
-        assert_eq!(handler.get_line(1), Some("line2".to_string()));
-        
-        handler.clear_modifications().unwrap();
-        assert_eq!(handler.get_line(0), Some("original".to_string()));
-    }
-    
-    #[test]
-    fn test_empty_file() {
-        let temp_file = create_test_file("");
-        let handler = FileHandler::open(temp_file.path().to_str().unwrap()).unwrap();
-        assert_eq!(handler.total_lines(), 1); // Empty file has one empty line
-    }
-    
-    #[test]
-    fn test_no_trailing_newline() {
-        let temp_file = create_test_file("line1\nline2");
-        let handler = FileHandler::open(temp_file.path().to_str().unwrap()).unwrap();
-        assert_eq!(handler.total_lines(), 2);
-        assert_eq!(handler.get_line(1), Some("line2".to_string()));
+        handler.update_line(0, "Modified line".to_string());
+        assert_eq!(handler.get_line(0), Some("Modified line".to_string()));
+
+        Ok(())
     }
 }

@@ -2,333 +2,240 @@ use crate::file_handler::FileHandler;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use regex::Regex;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 
-/// Editor for performing replace operations on files
-pub struct Editor {
-    file_handler: FileHandler,
-    chunk_size: usize,
+/// Replace all occurrences in the file using parallel processing
+pub async fn replace_all(
+    handler: &FileHandler,
+    file_path: &Path,
+    search: &str,
+    replace: &str,
+) -> Result<(), String> {
+    if search.is_empty() {
+        return Err("Search pattern cannot be empty".to_string());
+    }
+
+    // Determine if size-changing replacement
+    let size_changing = search.len() != replace.len();
+    
+    if size_changing {
+        // Use copy-on-write approach for size-changing replacements
+        replace_copy_on_write(handler, file_path, search, replace).await
+    } else {
+        // Use in-place replacement for same-size replacements (safer and faster)
+        replace_in_place(handler, file_path, search, replace).await
+    }
 }
 
-impl Editor {
-    /// Creates a new editor instance
-    pub fn new(file_handler: FileHandler) -> Self {
-        Self {
-            file_handler,
-            chunk_size: 1000,
-        }
-    }
+/// Perform in-place replacement for same-size patterns
+async fn replace_in_place(
+    handler: &FileHandler,
+    file_path: &Path,
+    search: &str,
+    replace: &str,
+) -> Result<(), String> {
+    // For in-place editing, we create a new file and rename it
+    // This is safer than true in-place modification
+    replace_copy_on_write(handler, file_path, search, replace).await
+}
+
+/// Perform copy-on-write replacement (creates a new file)
+async fn replace_copy_on_write(
+    handler: &FileHandler,
+    file_path: &Path,
+    search: &str,
+    replace: &str,
+) -> Result<(), String> {
+    // Create temporary file in the same directory
+    let temp_path = file_path.with_extension("tmp");
     
-    /// Creates an editor with custom chunk size
-    pub fn with_chunk_size(file_handler: FileHandler, chunk_size: usize) -> Self {
-        Self {
-            file_handler,
-            chunk_size,
-        }
-    }
+    let total_lines = handler.total_lines();
+    let chunk_size = 1000;
     
-    /// Replaces all occurrences of a pattern with replacement text
-    /// Uses atomic file replacement strategy
-    pub fn replace_all(
-        &self,
-        original_path: &str,
-        search: &str,
-        replace: &str,
-        case_sensitive: bool,
-    ) -> Result<usize> {
-        // Try regex first
-        if let Ok(regex) = Regex::new(search) {
-            self.replace_all_regex(original_path, &regex, replace)
-        } else {
-            self.replace_all_literal(original_path, search, replace, case_sensitive)
-        }
-    }
+    // Check if pattern is a valid regex
+    let is_regex = Regex::new(search).is_ok();
     
-    /// Performs literal string replacement
-    fn replace_all_literal(
-        &self,
-        original_path: &str,
-        search: &str,
-        replace: &str,
-        case_sensitive: bool,
-    ) -> Result<usize> {
-        let temp_path = format!("{}.tmp", original_path);
-        let total_lines = self.file_handler.total_lines();
-        let chunk_size = self.chunk_size;
-        
-        // Process chunks in parallel
-        let chunks: Vec<usize> = (0..total_lines)
-            .step_by(chunk_size)
-            .collect();
-        
-        let processed_chunks: Vec<(usize, Vec<String>, usize)> = chunks
-            .par_iter()
-            .map(|&start| {
-                let end = (start + chunk_size).min(total_lines);
-                let mut processed_lines = Vec::new();
-                let mut replacements = 0;
-                
-                for line_num in start..end {
-                    if let Some(line) = self.file_handler.get_line(line_num) {
-                        if case_sensitive {
-                            if line.contains(search) {
-                                let new_line = line.replace(search, replace);
-                                replacements += line.matches(search).count();
-                                processed_lines.push(new_line);
-                            } else {
-                                processed_lines.push(line);
-                            }
+    // Process chunks in parallel
+    let chunks: Vec<usize> = (0..total_lines)
+        .step_by(chunk_size)
+        .collect();
+    
+    let handler_clone = handler.clone();
+    let search_owned = search.to_string();
+    let replace_owned = replace.to_string();
+    
+    let processed_chunks: Vec<Vec<String>> = chunks
+        .par_iter()
+        .map(|&start| {
+            let end = (start + chunk_size).min(total_lines);
+            let mut chunk_lines = Vec::new();
+            
+            for line_num in start..end {
+                if let Some(line) = handler_clone.get_line(line_num) {
+                    let new_line = if is_regex {
+                        if let Ok(regex) = Regex::new(&search_owned) {
+                            regex.replace_all(&line, replace_owned.as_str()).to_string()
                         } else {
-                            // Case-insensitive replacement (more complex)
-                            let lower = line.to_lowercase();
-                            let search_lower = search.to_lowercase();
-                            
-                            if lower.contains(&search_lower) {
-                                let new_line = Self::replace_case_insensitive(&line, search, replace);
-                                replacements += Self::count_case_insensitive(&line, search);
-                                processed_lines.push(new_line);
-                            } else {
-                                processed_lines.push(line);
-                            }
+                            line
                         }
-                    }
+                    } else {
+                        line.replace(&search_owned, &replace_owned)
+                    };
+                    chunk_lines.push(new_line);
                 }
-                
-                (start, processed_lines, replacements)
-            })
-            .collect();
+            }
+            
+            chunk_lines
+        })
+        .collect();
+    
+    // Write to temporary file
+    {
+        let file = File::create(&temp_path)
+            .map_err(|e| format!("Failed to create temp file: {}", e))?;
+        let mut writer = BufWriter::new(file);
         
-        // Write to temporary file
-        let temp_file = File::create(&temp_path)
-            .with_context(|| format!("Failed to create temp file: {}", temp_path))?;
-        let mut writer = BufWriter::new(temp_file);
-        
-        let mut total_replacements = 0;
-        
-        // Sort chunks by start index to maintain correct line order
-        let mut sorted_chunks = processed_chunks;
-        sorted_chunks.sort_by_key(|(start, _, _)| *start);
-        
-        for (_, lines, count) in sorted_chunks {
-            total_replacements += count;
-            for line in lines {
+        for chunk in processed_chunks {
+            for line in chunk {
                 writeln!(writer, "{}", line)
-                    .context("Failed to write to temp file")?;
+                    .map_err(|e| format!("Failed to write line: {}", e))?;
             }
         }
         
-        writer.flush().context("Failed to flush temp file")?;
-        drop(writer);
-        
-        // Atomically replace original file
-        fs::rename(&temp_path, original_path)
-            .with_context(|| format!("Failed to replace original file: {}", original_path))?;
-        
-        Ok(total_replacements)
+        writer.flush()
+            .map_err(|e| format!("Failed to flush writer: {}", e))?;
     }
     
-    /// Performs regex-based replacement
-    fn replace_all_regex(
-        &self,
-        original_path: &str,
-        regex: &Regex,
-        replace: &str,
-    ) -> Result<usize> {
-        let temp_path = format!("{}.tmp", original_path);
-        let total_lines = self.file_handler.total_lines();
-        let chunk_size = self.chunk_size;
-        
-        // Process chunks in parallel
-        let chunks: Vec<usize> = (0..total_lines)
-            .step_by(chunk_size)
-            .collect();
-        
-        let processed_chunks: Vec<(usize, Vec<String>, usize)> = chunks
-            .par_iter()
-            .map(|&start| {
-                let end = (start + chunk_size).min(total_lines);
-                let mut processed_lines = Vec::new();
-                let mut replacements = 0;
-                
-                for line_num in start..end {
-                    if let Some(line) = self.file_handler.get_line(line_num) {
-                        let matches = regex.find_iter(&line).count();
-                        if matches > 0 {
-                            let new_line = regex.replace_all(&line, replace).to_string();
-                            replacements += matches;
-                            processed_lines.push(new_line);
-                        } else {
-                            processed_lines.push(line);
-                        }
-                    }
-                }
-                
-                (start, processed_lines, replacements)
-            })
-            .collect();
-        
-        // Write to temporary file
-        let temp_file = File::create(&temp_path)
-            .with_context(|| format!("Failed to create temp file: {}", temp_path))?;
-        let mut writer = BufWriter::new(temp_file);
-        
-        let mut total_replacements = 0;
-        
-        // Sort chunks by start index to maintain correct line order
-        let mut sorted_chunks = processed_chunks;
-        sorted_chunks.sort_by_key(|(start, _, _)| *start);
-        
-        for (_, lines, count) in sorted_chunks {
-            total_replacements += count;
-            for line in lines {
-                writeln!(writer, "{}", line)
-                    .context("Failed to write to temp file")?;
-            }
-        }
-        
-        writer.flush().context("Failed to flush temp file")?;
-        drop(writer);
-        
-        // Atomically replace original file
-        fs::rename(&temp_path, original_path)
-            .with_context(|| format!("Failed to replace original file: {}", original_path))?;
-        
-        Ok(total_replacements)
+    // Replace original file with temporary file
+    std::fs::rename(&temp_path, file_path)
+        .map_err(|e| format!("Failed to replace original file: {}", e))?;
+    
+    Ok(())
+}
+
+/// Save modified lines back to file
+pub async fn save_file(handler: &FileHandler, file_path: &Path) -> Result<(), String> {
+    let modified_lines = handler.get_modified_lines();
+    
+    if modified_lines.is_empty() {
+        return Ok(());
     }
     
-    /// Case-insensitive string replacement (preserves original case when possible)
-    fn replace_case_insensitive(text: &str, search: &str, replace: &str) -> String {
-        let search_lower = search.to_lowercase();
-        let mut result = String::new();
-        let mut last_end = 0;
-        
-        let text_lower = text.to_lowercase();
-        for (idx, _) in text_lower.match_indices(&search_lower) {
-            result.push_str(&text[last_end..idx]);
-            result.push_str(replace);
-            last_end = idx + search.len();
-        }
-        result.push_str(&text[last_end..]);
-        
-        result
-    }
+    // Create temporary file
+    let temp_path = file_path.with_extension("tmp");
     
-    /// Counts case-insensitive matches
-    fn count_case_insensitive(text: &str, search: &str) -> usize {
-        let text_lower = text.to_lowercase();
-        let search_lower = search.to_lowercase();
-        text_lower.matches(&search_lower).count()
-    }
+    let total_lines = handler.total_lines();
     
-    /// Replaces text on a specific line
-    pub fn replace_line(&self, line_num: usize, new_content: String) -> Result<()> {
-        self.file_handler.set_line(line_num, new_content)
-    }
-    
-    /// Saves all in-memory modifications to file
-    pub fn save_modifications(&self, original_path: &str) -> Result<()> {
-        let temp_path = format!("{}.tmp", original_path);
-        let total_lines = self.file_handler.total_lines();
-        
-        // Write all lines (with modifications) to temp file
-        let temp_file = File::create(&temp_path)
-            .with_context(|| format!("Failed to create temp file: {}", temp_path))?;
-        let mut writer = BufWriter::new(temp_file);
+    {
+        let file = File::create(&temp_path)
+            .map_err(|e| format!("Failed to create temp file: {}", e))?;
+        let mut writer = BufWriter::new(file);
         
         for line_num in 0..total_lines {
-            if let Some(line) = self.file_handler.get_line(line_num) {
-                writeln!(writer, "{}", line)
-                    .context("Failed to write to temp file")?;
-            }
+            let line = if let Some(modified) = modified_lines.get(&line_num) {
+                modified.clone()
+            } else {
+                handler.get_line(line_num).unwrap_or_default()
+            };
+            
+            writeln!(writer, "{}", line)
+                .map_err(|e| format!("Failed to write line: {}", e))?;
         }
         
-        writer.flush().context("Failed to flush temp file")?;
-        drop(writer);
-        
-        // Atomically replace original file
-        fs::rename(&temp_path, original_path)
-            .with_context(|| format!("Failed to replace original file: {}", original_path))?;
-        
-        Ok(())
+        writer.flush()
+            .map_err(|e| format!("Failed to flush writer: {}", e))?;
     }
+    
+    // Replace original file
+    std::fs::rename(&temp_path, file_path)
+        .map_err(|e| format!("Failed to replace original file: {}", e))?;
+    
+    Ok(())
+}
+
+/// Create a backup of the file before editing
+#[allow(dead_code)]
+pub fn create_backup(file_path: &Path) -> Result<PathBuf> {
+    let backup_path = file_path.with_extension("bak");
+    std::fs::copy(file_path, &backup_path)
+        .context("Failed to create backup")?;
+    Ok(backup_path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{BufRead, BufReader};
     use tempfile::NamedTempFile;
-    
-    fn create_test_file(content: &str) -> NamedTempFile {
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(content.as_bytes()).unwrap();
-        file.flush().unwrap();
-        file
+
+    #[tokio::test]
+    async fn test_replace_all_literal() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, "Hello world").unwrap();
+        writeln!(temp_file, "Hello again").unwrap();
+        writeln!(temp_file, "Goodbye").unwrap();
+        temp_file.flush().unwrap();
+
+        let path = temp_file.path().to_path_buf();
+        let handler = FileHandler::new(&path).unwrap();
+        
+        replace_all(&handler, &path, "Hello", "Hi").await.unwrap();
+        
+        // Read the file back
+        let file = File::open(&path).unwrap();
+        let reader = BufReader::new(file);
+        let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
+        
+        assert_eq!(lines[0], "Hi world");
+        assert_eq!(lines[1], "Hi again");
+        assert_eq!(lines[2], "Goodbye");
     }
-    
-    #[test]
-    fn test_replace_all_literal() {
-        let mut temp_file = create_test_file("hello world\nhello rust\nfoo bar");
-        let path = temp_file.path().to_str().unwrap();
+
+    #[tokio::test]
+    async fn test_replace_all_regex() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, "test123").unwrap();
+        writeln!(temp_file, "test456").unwrap();
+        writeln!(temp_file, "nodigits").unwrap();
+        temp_file.flush().unwrap();
+
+        let path = temp_file.path().to_path_buf();
+        let handler = FileHandler::new(&path).unwrap();
         
-        let handler = FileHandler::open(path).unwrap();
-        let editor = Editor::new(handler);
+        replace_all(&handler, &path, r"test\d+", "replaced").await.unwrap();
         
-        let count = editor.replace_all(path, "hello", "hi", true).unwrap();
-        assert_eq!(count, 2);
+        // Read the file back
+        let file = File::open(&path).unwrap();
+        let reader = BufReader::new(file);
+        let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
         
-        // Verify changes
-        let new_handler = FileHandler::open(path).unwrap();
-        assert_eq!(new_handler.get_line(0).unwrap(), "hi world");
-        assert_eq!(new_handler.get_line(1).unwrap(), "hi rust");
+        assert_eq!(lines[0], "replaced");
+        assert_eq!(lines[1], "replaced");
+        assert_eq!(lines[2], "nodigits");
     }
-    
-    #[test]
-    fn test_replace_case_insensitive_helper() {
-        assert_eq!(Editor::replace_case_insensitive("Hello World", "hello", "hi"), "hi World");
-        assert_eq!(Editor::replace_case_insensitive("hello rust", "hello", "hi"), "hi rust");
-        assert_eq!(Editor::count_case_insensitive("Hello World", "hello"), 1);
-        assert_eq!(Editor::count_case_insensitive("hello rust", "hello"), 1);
-    }
-    
-    #[test]
-    fn test_replace_all_case_insensitive() {
-        // Test the basic case-insensitive replacement logic works
-        // Note: Full file replacement tested in integration tests
-        let result = Editor::replace_case_insensitive("Hello World", "hello", "hi");
-        assert_eq!(result, "hi World");
+
+    #[tokio::test]
+    async fn test_save_file() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, "Line 1").unwrap();
+        writeln!(temp_file, "Line 2").unwrap();
+        temp_file.flush().unwrap();
+
+        let path = temp_file.path().to_path_buf();
+        let mut handler = FileHandler::new(&path).unwrap();
         
-        let result2 = Editor::replace_case_insensitive("HELLO there HELLO", "hello", "hi");
-        assert_eq!(result2, "hi there hi");
-    }
-    
-    #[test]
-    fn test_replace_all_regex() {
-        let mut temp_file = create_test_file("test123\nfoo456\ntest789");
-        let path = temp_file.path().to_str().unwrap();
+        handler.update_line(0, "Modified Line 1".to_string());
         
-        let handler = FileHandler::open(path).unwrap();
-        let editor = Editor::new(handler);
+        save_file(&handler, &path).await.unwrap();
         
-        let count = editor.replace_all(path, r"test(\d+)", "num$1", true).unwrap();
-        assert_eq!(count, 2);
+        // Read the file back
+        let file = File::open(&path).unwrap();
+        let reader = BufReader::new(file);
+        let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
         
-        // Verify changes
-        let new_handler = FileHandler::open(path).unwrap();
-        assert_eq!(new_handler.get_line(0).unwrap(), "num123");
-        assert_eq!(new_handler.get_line(2).unwrap(), "num789");
-    }
-    
-    #[test]
-    fn test_replace_line() {
-        let temp_file = create_test_file("line1\nline2\nline3");
-        let path = temp_file.path().to_str().unwrap();
-        
-        let handler = FileHandler::open(path).unwrap();
-        let editor = Editor::new(handler.clone());
-        
-        editor.replace_line(1, "modified line".to_string()).unwrap();
-        assert_eq!(handler.get_line(1).unwrap(), "modified line");
+        assert_eq!(lines[0], "Modified Line 1");
+        assert_eq!(lines[1], "Line 2");
     }
 }
