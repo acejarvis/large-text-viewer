@@ -417,7 +417,6 @@ impl TextViewerApp {
                                         }
                                         
                                         // Ensure labels don't consume scroll events
-                                        label.surrender_focus();
                                     });
                                 }
                             }
