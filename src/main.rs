@@ -1,10 +1,18 @@
+mod editor;
 mod file_handler;
 mod search;
-mod editor;
 
-use iced::widget::{button, column, container, row, scrollable, text, text_input};
-use iced::{Application, Command, Element, Length, Settings, Theme};
+use iced::widget::{button, column, container, row, scrollable, slider, text, text_input};
+use iced::{keyboard, Application, Command, Element, Event, Length, Settings, Subscription, Theme};
 use std::path::PathBuf;
+
+// Scrolling constants
+const LINES_PER_WHEEL_TICK: f32 = 3.0;
+const PIXELS_PER_LINE: f32 = 20.0;
+
+// Slider constants
+const SLIDER_WIDTH: f32 = 200.0;
+const SLIDER_STEP: f32 = 0.001;
 
 pub fn main() -> iced::Result {
     LargeTextFileViewer::run(Settings::default())
@@ -15,6 +23,9 @@ pub enum Message {
     OpenFile,
     FileOpened(Result<PathBuf, String>),
     ScrollTo(usize),
+    ScrollBy(i32), // Scroll by a number of lines (positive = down, negative = up)
+    ScrollToPosition(f32), // Scroll to a position (0.0 to 1.0)
+    EventOccurred(Event),
     Search(String),
     SearchNext,
     SearchPrevious,
@@ -55,6 +66,21 @@ impl Default for LargeTextFileViewer {
     }
 }
 
+impl LargeTextFileViewer {
+    fn scroll_by(&mut self, lines: i32) -> Command<Message> {
+        if let Some(handler) = &self.file_handler {
+            let total_lines = handler.total_lines();
+            let new_start = if lines < 0 {
+                self.viewport_start.saturating_sub(lines.unsigned_abs() as usize)
+            } else {
+                self.viewport_start.saturating_add(lines as usize)
+            };
+            self.viewport_start = new_start.min(total_lines.saturating_sub(self.viewport_size));
+        }
+        Command::none()
+    }
+}
+
 impl Application for LargeTextFileViewer {
     type Executor = iced::executor::Default;
     type Message = Message;
@@ -69,39 +95,102 @@ impl Application for LargeTextFileViewer {
         String::from("Large Text File Viewer")
     }
 
+    fn subscription(&self) -> Subscription<Self::Message> {
+        iced::event::listen().map(Message::EventOccurred)
+    }
+
     fn update(&mut self, message: Self::Message) -> Command<Self::Message> {
         match message {
-            Message::OpenFile => {
-                Command::perform(
-                    async {
-                        rfd::AsyncFileDialog::new()
-                            .pick_file()
-                            .await
-                            .map(|handle| handle.path().to_path_buf())
-                            .ok_or_else(|| "No file selected".to_string())
-                    },
-                    Message::FileOpened,
-                )
+            Message::EventOccurred(event) => {
+                if let Event::Keyboard(keyboard::Event::KeyPressed {
+                    key,
+                    modifiers: _,
+                    ..
+                }) = event
+                {
+                    match key.as_ref() {
+                        keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+                            return self.scroll_by(-1);
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
+                            return self.scroll_by(1);
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::PageUp) => {
+                            return self.scroll_by(-(self.viewport_size as i32));
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::PageDown) => {
+                            return self.scroll_by(self.viewport_size as i32);
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::Home) => {
+                            if self.file_handler.is_some() {
+                                self.viewport_start = 0;
+                            }
+                            return Command::none();
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::End) => {
+                            if let Some(handler) = &self.file_handler {
+                                let total_lines = handler.total_lines();
+                                self.viewport_start =
+                                    total_lines.saturating_sub(self.viewport_size);
+                            }
+                            return Command::none();
+                        }
+                        _ => {}
+                    }
+                } else if let Event::Mouse(mouse_event) = event {
+                    if let iced::mouse::Event::WheelScrolled { delta } = mouse_event {
+                        let scroll_lines = match delta {
+                            iced::mouse::ScrollDelta::Lines { y, .. } => {
+                                (-y * LINES_PER_WHEEL_TICK).clamp(i32::MIN as f32, i32::MAX as f32) as i32
+                            }
+                            iced::mouse::ScrollDelta::Pixels { y, .. } => {
+                                (-y / PIXELS_PER_LINE).clamp(i32::MIN as f32, i32::MAX as f32) as i32
+                            }
+                        };
+                        return self.scroll_by(scroll_lines);
+                    }
+                }
+                Command::none()
             }
+            Message::ScrollBy(lines) => self.scroll_by(lines),
+            Message::ScrollToPosition(position) => {
+                if let Some(handler) = &self.file_handler {
+                    let total_lines = handler.total_lines();
+                    let max_scroll_position = total_lines.saturating_sub(self.viewport_size);
+                    if max_scroll_position > 0 {
+                        let target_line = (position * max_scroll_position as f32) as usize;
+                        self.viewport_start = target_line.min(max_scroll_position);
+                    }
+                }
+                Command::none()
+            }
+            Message::OpenFile => Command::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .pick_file()
+                        .await
+                        .map(|handle| handle.path().to_path_buf())
+                        .ok_or_else(|| "No file selected".to_string())
+                },
+                Message::FileOpened,
+            ),
             Message::FileOpened(result) => {
                 match result {
-                    Ok(path) => {
-                        match file_handler::FileHandler::new(&path) {
-                            Ok(handler) => {
-                                self.file_path = Some(path.clone());
-                                self.file_handler = Some(handler);
-                                self.viewport_start = 0;
-                                self.status_message = format!(
-                                    "Loaded: {} ({} lines)",
-                                    path.display(),
-                                    self.file_handler.as_ref().unwrap().total_lines()
-                                );
-                            }
-                            Err(e) => {
-                                self.status_message = format!("Error loading file: {}", e);
-                            }
+                    Ok(path) => match file_handler::FileHandler::new(&path) {
+                        Ok(handler) => {
+                            self.file_path = Some(path.clone());
+                            self.file_handler = Some(handler);
+                            self.viewport_start = 0;
+                            self.status_message = format!(
+                                "Loaded: {} ({} lines)",
+                                path.display(),
+                                self.file_handler.as_ref().unwrap().total_lines()
+                            );
                         }
-                    }
+                        Err(e) => {
+                            self.status_message = format!("Error loading file: {}", e);
+                        }
+                    },
                     Err(e) => {
                         self.status_message = e;
                     }
@@ -120,9 +209,7 @@ impl Application for LargeTextFileViewer {
                 if let Some(handler) = &self.file_handler {
                     let handler_clone = handler.clone();
                     Command::perform(
-                        async move {
-                            search::search_file(&handler_clone, &query).await
-                        },
+                        async move { search::search_file(&handler_clone, &query).await },
                         Message::SearchComplete,
                     )
                 } else {
@@ -176,10 +263,16 @@ impl Application for LargeTextFileViewer {
                         let search_query = self.search_query.clone();
                         let replace_text = self.replace_text.clone();
                         let handler_clone = handler.clone();
-                        
+
                         Command::perform(
                             async move {
-                                editor::replace_all(&handler_clone, &path_clone, &search_query, &replace_text).await
+                                editor::replace_all(
+                                    &handler_clone,
+                                    &path_clone,
+                                    &search_query,
+                                    &replace_text,
+                                )
+                                .await
                             },
                             Message::ReplaceComplete,
                         )
@@ -223,11 +316,9 @@ impl Application for LargeTextFileViewer {
                     if let Some(path) = &self.file_path {
                         let path_clone = path.clone();
                         let handler_clone = handler.clone();
-                        
+
                         Command::perform(
-                            async move {
-                                editor::save_file(&handler_clone, &path_clone).await
-                            },
+                            async move { editor::save_file(&handler_clone, &path_clone).await },
                             Message::FileSaved,
                         )
                     } else {
@@ -282,56 +373,64 @@ impl Application for LargeTextFileViewer {
 
         let content_view = if let Some(handler) = &self.file_handler {
             let lines = handler.get_viewport_lines(self.viewport_start, self.viewport_size);
-            
+
             let mut line_widgets = Vec::new();
             for (idx, line) in lines.iter().enumerate() {
                 let line_num = self.viewport_start + idx;
                 let is_match = self.search_results.contains(&line_num);
-                
+
                 let line_text = if is_match {
-                    text(format!("{}: {} [MATCH]", line_num + 1, line))
-                        .size(14)
+                    text(format!("{}: {} [MATCH]", line_num + 1, line)).size(14)
                 } else {
-                    text(format!("{}: {}", line_num + 1, line))
-                        .size(14)
+                    text(format!("{}: {}", line_num + 1, line)).size(14)
                 };
-                
+
                 line_widgets.push(line_text.into());
             }
-            
+
             scrollable(column(line_widgets).spacing(2))
+                .direction(scrollable::Direction::Vertical(
+                    scrollable::Properties::default()
+                ))
                 .height(Length::Fill)
         } else {
             scrollable(
-                column![text("No file loaded. Click 'Open File' to get started.")]
-                    .padding(20)
+                column![text("No file loaded. Click 'Open File' to get started.")].padding(20),
             )
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Properties::default()
+            ))
             .height(Length::Fill)
         };
 
-        let status_bar = container(
-            text(&self.status_message).size(12)
-        )
-        .padding(5)
-        .width(Length::Fill);
+        let status_bar = container(text(&self.status_message).size(12))
+            .padding(5)
+            .width(Length::Fill);
 
-        let navigation_bar = if self.file_handler.is_some() {
+        let navigation_bar = if let Some(handler) = &self.file_handler {
+            let total_lines = handler.total_lines();
+            let end_line = (self.viewport_start + self.viewport_size).min(total_lines);
+            
+            // Calculate slider position (0.0 to 1.0) based on the scrollable range
+            let max_scroll_position = total_lines.saturating_sub(self.viewport_size);
+            let slider_position = if max_scroll_position > 0 {
+                self.viewport_start as f32 / max_scroll_position as f32
+            } else {
+                0.0
+            };
+
             row![
                 button("Top").on_press(Message::ScrollTo(0)),
-                button("Page Up").on_press(Message::ScrollTo(
-                    self.viewport_start.saturating_sub(self.viewport_size)
-                )),
-                button("Page Down").on_press(Message::ScrollTo(
-                    self.viewport_start + self.viewport_size
-                )),
                 text(format!(
                     "Lines {}-{} of {}",
                     self.viewport_start + 1,
-                    (self.viewport_start + self.viewport_size).min(
-                        self.file_handler.as_ref().unwrap().total_lines()
-                    ),
-                    self.file_handler.as_ref().unwrap().total_lines()
-                ))
+                    end_line,
+                    total_lines
+                )),
+                text("Position:"),
+                slider(0.0..=1.0, slider_position, Message::ScrollToPosition)
+                    .width(Length::Fixed(SLIDER_WIDTH))
+                    .step(SLIDER_STEP),
             ]
             .spacing(10)
             .padding(10)
@@ -348,7 +447,7 @@ impl Application for LargeTextFileViewer {
                 content_view,
                 status_bar,
             ]
-            .spacing(0)
+            .spacing(0),
         )
         .width(Length::Fill)
         .height(Length::Fill)
