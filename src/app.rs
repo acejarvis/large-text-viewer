@@ -427,6 +427,8 @@ impl TextViewerApp {
                 // Update scroll_line to match what was actually displayed
                 if let Some(first_row) = first_visible_row {
                     self.scroll_line = first_row;
+                } else {
+                    self.scroll_line = 0;
                 }
             } else {
                 ui.centered_and_justified(|ui| {
