@@ -358,7 +358,8 @@ impl TextViewerApp {
                         self.line_indexer.total_lines(),
                         |ui, row_range| {
                             for line_num in row_range {
-                                if let Some((start, end)) = self.line_indexer.get_line_range(line_num) {
+                                // Use get_line_with_reader for sparse index support
+                                if let Some((start, end)) = self.line_indexer.get_line_with_reader(line_num, reader) {
                                     let line_text = reader.get_chunk(start, end);
                                     let line_text = line_text.trim_end_matches('\n').trim_end_matches('\r');
                                     

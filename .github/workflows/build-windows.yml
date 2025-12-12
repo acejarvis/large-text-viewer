@@ -1,8 +1,6 @@
 name: Build Windows
 
 on:
-  push:
-    branches: [ main ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
@@ -54,7 +52,7 @@ jobs:
     - name: Upload Windows binary
       uses: actions/upload-artifact@v4
       with:
-        name: large-text-file-viewer-windows
+        name: large-text-viewer-windows
         path: target/release/large-text-viewer.exe
         if-no-files-found: error
         retention-days: 5
