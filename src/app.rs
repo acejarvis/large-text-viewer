@@ -1,7 +1,6 @@
 use eframe::egui;
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::thread;
+use std::sync::mpsc::{channel, Receiver};
 use notify::{Watcher, RecursiveMode, Result as NotifyResult};
 use encoding_rs::Encoding;
 
@@ -365,7 +364,11 @@ impl TextViewerApp {
                 let line_height = self.font_size * 1.5;
                 self.visible_lines = (available_height / line_height) as usize + 2;
 
-                let mut scroll_area = egui::ScrollArea::vertical()
+                let mut scroll_area = if self.wrap_mode {
+                    egui::ScrollArea::vertical()
+                } else {
+                    egui::ScrollArea::both()
+                }
                     .id_salt("text_scroll_area")
                     .auto_shrink([false, false])
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
@@ -412,7 +415,12 @@ impl TextViewerApp {
                                             text = text.background_color(egui::Color32::from_rgb(100, 100, 0));
                                         }
                                         
-                                        let label = ui.label(text);
+                                        // Apply wrap mode
+                                        let label = if self.wrap_mode {
+                                            ui.add(egui::Label::new(text).wrap())
+                                        } else {
+                                            ui.add(egui::Label::new(text).extend())
+                                        };
                                         
                                         // Enable text selection for copy-paste
                                         if label.hovered() {
