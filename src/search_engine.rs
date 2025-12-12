@@ -90,11 +90,10 @@ impl SearchEngine {
             // Recalculate line number for overlap region to avoid double counting
             let overlap_bytes = reader.get_bytes(chunk_start, chunk_end);
             let overlap_text = match std::str::from_utf8(overlap_bytes) {
-                Ok(t) => t,
+                Ok(t) => t.to_string(),
                 Err(_) => {
                     let (cow, _, _) = reader.encoding().decode(overlap_bytes);
-                    line_number -= cow.lines().count().saturating_sub(1);
-                    continue;
+                    cow.into_owned()
                 }
             };
             line_number -= overlap_text.lines().count().saturating_sub(1);
@@ -119,8 +118,8 @@ impl SearchEngine {
         while let Some(match_pos) = chunk_lower[pos..].find(&query_lower) {
             let absolute_pos = pos + match_pos;
             
-            // Count newlines up to this position
-            for (i, ch) in chunk_text[last_newline..absolute_pos].chars().enumerate() {
+            // Count newlines up to this position (byte-based iteration)
+            for ch in chunk_text[last_newline..absolute_pos].chars() {
                 if ch == '\n' {
                     current_line += 1;
                 }
