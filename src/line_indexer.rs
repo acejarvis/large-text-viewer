@@ -4,6 +4,10 @@ pub struct LineIndexer {
     line_offsets: Vec<usize>,
     total_lines: usize,
     indexed: bool,
+    // Sparse sampling for large files
+    sample_interval: usize,
+    file_size: usize,
+    avg_line_length: f64,
 }
 
 impl LineIndexer {
@@ -12,28 +16,38 @@ impl LineIndexer {
             line_offsets: vec![0],
             total_lines: 0,
             indexed: false,
+            sample_interval: 0,
+            file_size: 0,
+            avg_line_length: 80.0,
         }
     }
 
     pub fn index_file(&mut self, reader: &FileReader) {
         self.line_offsets.clear();
         self.line_offsets.push(0);
+        self.file_size = reader.len();
 
-        let data = reader.all_data();
-        let file_size = data.len();
-
-        // For very large files, sample every N bytes to build approximate index
-        const SAMPLE_THRESHOLD: usize = 100_000_000; // 100 MB
+        // For small files (< 10MB), do full indexing
+        // For large files, use sparse sampling only
+        const FULL_INDEX_THRESHOLD: usize = 10_000_000; // 10 MB
         
-        if file_size > SAMPLE_THRESHOLD {
-            // Sample-based indexing for very large files
-            self.sample_index(data, file_size);
-        } else {
+        if self.file_size <= FULL_INDEX_THRESHOLD {
             // Full indexing for smaller files
+            let data = reader.all_data();
             self.full_index(data);
+            self.sample_interval = 0;
+        } else {
+            // Sparse sampling for large files - only sample at intervals
+            self.sparse_sample_index(reader);
         }
 
-        self.total_lines = self.line_offsets.len();
+        self.total_lines = if self.sample_interval > 0 {
+            // Estimate total lines based on sampling
+            self.estimate_total_lines()
+        } else {
+            self.line_offsets.len()
+        };
+        
         self.indexed = true;
     }
 
@@ -45,43 +59,125 @@ impl LineIndexer {
         }
     }
 
-    fn sample_index(&mut self, data: &[u8], file_size: usize) {
-        // Sample every 1MB
-        const SAMPLE_INTERVAL: usize = 1_000_000;
+    fn sparse_sample_index(&mut self, reader: &FileReader) {
+        // Only sample every 10MB for large files - creates sparse checkpoint index
+        const SPARSE_SAMPLE_SIZE: usize = 10_000_000; // 10MB
+        self.sample_interval = SPARSE_SAMPLE_SIZE;
+        
         let mut pos = 0;
-
-        while pos < file_size {
-            // Find newlines in this chunk
-            let end = (pos + SAMPLE_INTERVAL).min(file_size);
-            for i in pos..end {
-                if data[i] == b'\n' {
-                    self.line_offsets.push(i + 1);
+        let mut total_newlines_in_samples = 0;
+        let sample_count_limit = 100; // Limit to 100 samples max
+        let mut sample_count = 0;
+        
+        // Sample a few chunks to estimate average line length
+        while pos < self.file_size && sample_count < sample_count_limit {
+            let chunk_end = (pos + SPARSE_SAMPLE_SIZE).min(self.file_size);
+            let chunk = reader.get_bytes(pos, chunk_end);
+            
+            // Count newlines in first chunk to estimate
+            if sample_count == 0 {
+                let newline_count = chunk.iter().filter(|&&b| b == b'\n').count();
+                total_newlines_in_samples = newline_count;
+                if newline_count > 0 {
+                    self.avg_line_length = chunk.len() as f64 / newline_count as f64;
                 }
             }
-            pos = end;
+            
+            // Store checkpoint at this position
+            self.line_offsets.push(pos);
+            
+            pos = chunk_end;
+            sample_count += 1;
+        }
+    }
+
+    fn estimate_total_lines(&self) -> usize {
+        if self.avg_line_length > 0.0 {
+            (self.file_size as f64 / self.avg_line_length) as usize
+        } else {
+            self.file_size / 80 // Assume 80 char average if unknown
         }
     }
 
     pub fn get_line_offset(&self, line_num: usize) -> Option<usize> {
-        if line_num >= self.line_offsets.len() {
-            return None;
+        if self.sample_interval == 0 {
+            // Full index available
+            if line_num >= self.line_offsets.len() {
+                return None;
+            }
+            Some(self.line_offsets[line_num])
+        } else {
+            // Sparse index - estimate position
+            Some((line_num as f64 * self.avg_line_length) as usize)
         }
-        Some(self.line_offsets[line_num])
     }
 
     pub fn get_line_range(&self, line_num: usize) -> Option<(usize, usize)> {
-        if line_num >= self.line_offsets.len() {
+        if self.sample_interval == 0 {
+            // Full index available
+            if line_num >= self.line_offsets.len() {
+                return None;
+            }
+            
+            let start = self.line_offsets[line_num];
+            let end = if line_num + 1 < self.line_offsets.len() {
+                self.line_offsets[line_num + 1]
+            } else {
+                usize::MAX
+            };
+            
+            Some((start, end))
+        } else {
+            // Sparse index - estimate line position
+            // This will be resolved on-demand in get_line_with_reader
+            let estimated_pos = (line_num as f64 * self.avg_line_length) as usize;
+            Some((estimated_pos, usize::MAX))
+        }
+    }
+
+    // Helper method to get actual line content by scanning from estimated position
+    pub fn get_line_with_reader(&self, line_num: usize, reader: &FileReader) -> Option<(usize, usize)> {
+        if self.sample_interval == 0 {
+            // Use full index
+            return self.get_line_range(line_num);
+        }
+        
+        // For sparse index, estimate and scan
+        let estimated_byte_pos = (line_num as f64 * self.avg_line_length) as usize;
+        
+        // Scan backwards to find start of line (in case we landed mid-line)
+        let scan_start = estimated_byte_pos.saturating_sub(500).min(self.file_size);
+        let scan_end = (estimated_byte_pos + 1000).min(self.file_size);
+        
+        if scan_start >= scan_end {
             return None;
         }
         
-        let start = self.line_offsets[line_num];
-        let end = if line_num + 1 < self.line_offsets.len() {
-            self.line_offsets[line_num + 1]
-        } else {
-            usize::MAX
-        };
+        let chunk = reader.get_bytes(scan_start, scan_end);
         
-        Some((start, end))
+        // Find newline before our estimated position
+        let relative_est = estimated_byte_pos.saturating_sub(scan_start);
+        let mut line_start = scan_start;
+        
+        for i in (0..relative_est.min(chunk.len())).rev() {
+            if chunk[i] == b'\n' {
+                line_start = scan_start + i + 1;
+                break;
+            }
+        }
+        
+        // Find newline after our position for line end
+        let mut line_end = scan_end;
+        let search_from = relative_est.min(chunk.len());
+        
+        for i in search_from..chunk.len() {
+            if chunk[i] == b'\n' {
+                line_end = scan_start + i;
+                break;
+            }
+        }
+        
+        Some((line_start, line_end))
     }
 
     pub fn find_line_at_offset(&self, offset: usize) -> usize {
