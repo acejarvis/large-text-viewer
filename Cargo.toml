@@ -2,37 +2,13 @@
 name = "large-text-viewer"
 version = "0.1.0"
 edition = "2021"
-authors = ["Jarvis Wang <jarvis.wang@mail.utoronto.ca>"]
-description = "A cross-platform GUI app for viewing and editing multi-GB text files"
-license = "MIT"
 
 [dependencies]
-# GUI framework
-iced = { version = "0.12", features = ["tokio", "advanced"] }
-
-# Memory-mapped file I/O
+eframe = "0.29"
+egui = "0.29"
 memmap2 = "0.9"
-
-# Multithreading for search/replace
-rayon = "1.10"
-
-# Regex support for search
+encoding_rs = "0.8"
+notify = "6.1"
 regex = "1.10"
-
-# Async runtime
-tokio = { version = "1.35", features = ["full"] }
-
-# Error handling
+rfd = "0.15"
 anyhow = "1.0"
-thiserror = "1.0"
-
-# File dialogs
-rfd = "0.14"
-
-[dev-dependencies]
-tempfile = "3.8"
-
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
