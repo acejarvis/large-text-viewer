@@ -206,8 +206,9 @@ impl TextViewerApp {
     fn go_to_line(&mut self) {
         if let Ok(line_num) = self.goto_line_input.parse::<usize>() {
             if line_num > 0 && line_num <= self.line_indexer.total_lines() {
-                let target_line = line_num - 1; // 0-indexed, show at top of viewport
-                self.scroll_line = target_line;
+                let target_line = line_num - 1; // 0-indexed
+                // Show a few lines of context above the target line for better orientation
+                self.scroll_line = target_line.saturating_sub(3);
                 self.scroll_to_row = Some(target_line);
                 self.status_message = format!("Jumped to line {}", line_num);
             } else {
