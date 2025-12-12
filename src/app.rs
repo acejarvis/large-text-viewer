@@ -368,7 +368,6 @@ impl TextViewerApp {
                     .id_salt("text_scroll_area")
                     .auto_shrink([false, false])
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                    .enable_scrolling(true)
                     .drag_to_scroll(true);
                 
                 // Apply programmatic scroll if requested
