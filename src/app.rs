@@ -50,6 +50,9 @@ pub struct TextViewerApp {
     // Selection state for copy-paste
     selection_start: Option<(usize, usize)>, // (line, column)
     selection_end: Option<(usize, usize)>,
+    
+    // Programmatic scroll control
+    scroll_to_row: Option<usize>,
 }
 
 impl Default for TextViewerApp {
@@ -79,6 +82,7 @@ impl Default for TextViewerApp {
             show_encoding_selector: false,
             selection_start: None,
             selection_end: None,
+            scroll_to_row: None,
         }
     }
 }
@@ -139,7 +143,9 @@ impl TextViewerApp {
                     // Scroll to bottom in tail mode
                     if self.tail_mode {
                         let total_lines = self.line_indexer.total_lines();
-                        self.scroll_line = total_lines.saturating_sub(self.visible_lines);
+                        let target_line = total_lines.saturating_sub(self.visible_lines);
+                        self.scroll_line = target_line;
+                        self.scroll_to_row = Some(target_line);
                     }
                 }
             }
@@ -158,7 +164,9 @@ impl TextViewerApp {
                 Ok(_) => {
                     self.search_results = self.search_engine.results().to_vec();
                     if !self.search_results.is_empty() {
-                        self.scroll_line = self.search_results[0].line_number.saturating_sub(5);
+                        let target_line = self.search_results[0].line_number; // Show first result at top
+                        self.scroll_line = target_line;
+                        self.scroll_to_row = Some(target_line);
                         self.status_message = format!("Found {} matches", self.search_results.len());
                     } else {
                         self.status_message = "No matches found".to_string();
@@ -175,7 +183,9 @@ impl TextViewerApp {
         if !self.search_results.is_empty() {
             self.current_result_index = (self.current_result_index + 1) % self.search_results.len();
             let result = &self.search_results[self.current_result_index];
-            self.scroll_line = result.line_number.saturating_sub(5);
+            let target_line = result.line_number; // Show search result line at top
+            self.scroll_line = target_line;
+            self.scroll_to_row = Some(target_line);
         }
     }
 
@@ -187,14 +197,18 @@ impl TextViewerApp {
                 self.current_result_index - 1
             };
             let result = &self.search_results[self.current_result_index];
-            self.scroll_line = result.line_number.saturating_sub(5);
+            let target_line = result.line_number; // Show search result line at top
+            self.scroll_line = target_line;
+            self.scroll_to_row = Some(target_line);
         }
     }
 
     fn go_to_line(&mut self) {
         if let Ok(line_num) = self.goto_line_input.parse::<usize>() {
             if line_num > 0 && line_num <= self.line_indexer.total_lines() {
-                self.scroll_line = (line_num - 1).saturating_sub(5);
+                let target_line = line_num - 1; // 0-indexed, show at top of viewport
+                self.scroll_line = target_line;
+                self.scroll_to_row = Some(target_line);
                 self.status_message = format!("Jumped to line {}", line_num);
             } else {
                 self.status_message = "Line number out of range".to_string();
@@ -350,13 +364,30 @@ impl TextViewerApp {
                 let line_height = self.font_size * 1.5;
                 self.visible_lines = (available_height / line_height) as usize + 2;
 
-                egui::ScrollArea::vertical()
+                let mut scroll_area = egui::ScrollArea::vertical()
+                    .id_salt("text_scroll_area")
                     .auto_shrink([false, false])
-                    .show_rows(
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                    .enable_scrolling(true)
+                    .drag_to_scroll(true);
+                
+                // Apply programmatic scroll if requested
+                if let Some(target_row) = self.scroll_to_row.take() {
+                    scroll_area = scroll_area.vertical_scroll_offset(target_row as f32 * line_height);
+                }
+                
+                let mut first_visible_row = None;
+                
+                scroll_area.show_rows(
                         ui,
                         line_height,
                         self.line_indexer.total_lines(),
                         |ui, row_range| {
+                            // Capture the first visible row
+                            if first_visible_row.is_none() {
+                                first_visible_row = row_range.clone().next();
+                            }
+                            
                             for line_num in row_range {
                                 // Use get_line_with_reader for sparse index support
                                 if let Some((start, end)) = self.line_indexer.get_line_with_reader(line_num, reader) {
@@ -387,11 +418,19 @@ impl TextViewerApp {
                                         if label.hovered() {
                                             ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Text);
                                         }
+                                        
+                                        // Ensure labels don't consume scroll events
+                                        label.surrender_focus();
                                     });
                                 }
                             }
                         },
                     );
+                
+                // Update scroll_line to match what was actually displayed
+                if let Some(first_row) = first_visible_row {
+                    self.scroll_line = first_row;
+                }
             } else {
                 ui.centered_and_justified(|ui| {
                     ui.heading("Large Text Viewer");
