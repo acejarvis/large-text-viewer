@@ -383,9 +383,7 @@ impl TextViewerApp {
                         self.line_indexer.total_lines(),
                         |ui, row_range| {
                             // Capture the first visible row
-                            if first_visible_row.is_none() {
-                                first_visible_row = row_range.clone().next();
-                            }
+                            first_visible_row = row_range.clone().next();
                             
                             for line_num in row_range {
                                 // Use get_line_with_reader for sparse index support
