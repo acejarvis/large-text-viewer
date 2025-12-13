@@ -65,7 +65,6 @@ impl LineIndexer {
         self.sample_interval = SPARSE_SAMPLE_SIZE;
         
         let mut pos = 0;
-        let mut total_newlines_in_samples = 0;
         let sample_count_limit = 100; // Limit to 100 samples max
         let mut sample_count = 0;
         
@@ -77,7 +76,6 @@ impl LineIndexer {
             // Count newlines in first chunk to estimate
             if sample_count == 0 {
                 let newline_count = chunk.iter().filter(|&&b| b == b'\n').count();
-                total_newlines_in_samples = newline_count;
                 if newline_count > 0 {
                     self.avg_line_length = chunk.len() as f64 / newline_count as f64;
                 }
@@ -99,6 +97,7 @@ impl LineIndexer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn get_line_offset(&self, line_num: usize) -> Option<usize> {
         if self.sample_interval == 0 {
             // Full index available
@@ -180,6 +179,7 @@ impl LineIndexer {
         Some((line_start, line_end))
     }
 
+    #[allow(dead_code)]
     pub fn find_line_at_offset(&self, offset: usize) -> usize {
         match self.line_offsets.binary_search(&offset) {
             Ok(line) => line,
@@ -191,6 +191,7 @@ impl LineIndexer {
         self.total_lines
     }
 
+    #[allow(dead_code)]
     pub fn is_indexed(&self) -> bool {
         self.indexed
     }

@@ -13,7 +13,6 @@ pub struct FileReader {
 impl FileReader {
     pub fn new(path: PathBuf, encoding: &'static Encoding) -> Result<Self> {
         let file = File::open(&path)?;
-        let file = File::open(&path)?;
         let metadata = file.metadata()?;
         if metadata.len() == 0 {
             anyhow::bail!("Cannot memory-map an empty file: {:?}", path);

@@ -6,12 +6,15 @@ pub struct SearchEngine {
     use_regex: bool,
     regex: Option<Regex>,
     results: Vec<SearchResult>,
+    total_results: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct SearchResult {
+    #[allow(dead_code)]
     pub byte_offset: usize,
     pub line_number: usize,
+    #[allow(dead_code)]
     pub match_text: String,
 }
 
@@ -22,6 +25,7 @@ impl SearchEngine {
             use_regex: false,
             regex: None,
             results: Vec::new(),
+            total_results: 0,
         }
     }
 
@@ -44,6 +48,8 @@ impl SearchEngine {
         if self.query.is_empty() {
             return Ok(());
         }
+
+        self.total_results = 0;
 
         // Use chunked search to avoid loading entire file into memory
         self.search_chunked(reader, max_results)
@@ -129,11 +135,16 @@ impl SearchEngine {
             // Extract actual match text (preserve case)
             let match_text = chunk_text[absolute_pos..absolute_pos.min(absolute_pos + self.query.len())].to_string();
             
-            self.results.push(SearchResult {
-                byte_offset: chunk_offset + absolute_pos,
-                line_number: current_line,
-                match_text,
-            });
+            // Count every match, even if we stop storing due to max_results
+            self.total_results += 1;
+
+            if self.results.len() < max_results {
+                self.results.push(SearchResult {
+                    byte_offset: chunk_offset + absolute_pos,
+                    line_number: current_line,
+                    match_text,
+                });
+            }
             
             if self.results.len() >= max_results {
                 break;
@@ -170,11 +181,16 @@ impl SearchEngine {
                 }
                 last_pos = mat.start();
                 
-                self.results.push(SearchResult {
-                    byte_offset: chunk_offset + mat.start(),
-                    line_number: current_line,
-                    match_text: mat.as_str().to_string(),
-                });
+                // Count every match, even if we stop storing due to max_results
+                self.total_results += 1;
+
+                if self.results.len() < max_results {
+                    self.results.push(SearchResult {
+                        byte_offset: chunk_offset + mat.start(),
+                        line_number: current_line,
+                        match_text: mat.as_str().to_string(),
+                    });
+                }
             }
             
             // Update line number for remaining chunk
@@ -190,6 +206,11 @@ impl SearchEngine {
         &self.results
     }
 
+    pub fn total_results(&self) -> usize {
+        self.total_results
+    }
+
+    #[allow(dead_code)]
     pub fn has_results(&self) -> bool {
         !self.results.is_empty()
     }
@@ -198,5 +219,6 @@ impl SearchEngine {
         self.query.clear();
         self.results.clear();
         self.regex = None;
+        self.total_results = 0;
     }
 }
