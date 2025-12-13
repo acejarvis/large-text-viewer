@@ -1,6 +1,7 @@
 mod file_reader;
 mod line_indexer;
 mod search_engine;
+mod replacer;
 mod app;
 
 use eframe::egui;

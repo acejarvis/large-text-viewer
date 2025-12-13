@@ -21,10 +21,16 @@ pub struct ChunkSearchResult {
     pub matches: Vec<SearchResult>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SearchType {
+    Count,
+    Fetch,
+}
+
 pub enum SearchMessage {
     ChunkResult(ChunkSearchResult),
     CountResult(usize),
-    Done,
+    Done(SearchType),
     Error(String),
 }
 
@@ -62,7 +68,7 @@ impl SearchEngine {
         let file_len = reader.len();
         if file_len == 0 || self.query.is_empty() {
             let _ = tx.send(SearchMessage::CountResult(0));
-            let _ = tx.send(SearchMessage::Done);
+            let _ = tx.send(SearchMessage::Done(SearchType::Count));
             return;
         }
 
@@ -146,7 +152,7 @@ impl SearchEngine {
                 let _ = h.join();
             }
             if !cancel_token.load(Ordering::Relaxed) {
-                let _ = tx.send(SearchMessage::Done);
+                let _ = tx.send(SearchMessage::Done(SearchType::Count));
             }
         });
     }
@@ -161,7 +167,7 @@ impl SearchEngine {
     ) {
         let file_len = reader.len();
         if file_len == 0 || self.query.is_empty() {
-            let _ = tx.send(SearchMessage::Done);
+            let _ = tx.send(SearchMessage::Done(SearchType::Fetch));
             return;
         }
 
@@ -243,7 +249,7 @@ impl SearchEngine {
                     chunk_start = chunk_end - overlap;
                 }
                 if !cancel_token.load(Ordering::Relaxed) {
-                    let _ = tx.send(SearchMessage::Done);
+                    let _ = tx.send(SearchMessage::Done(SearchType::Fetch));
                 }
             } else {
                  let _ = tx.send(SearchMessage::Error("Invalid regex".to_string()));
@@ -259,7 +265,7 @@ impl SearchEngine {
     ) {
         let file_len = reader.len();
         if file_len == 0 || self.query.is_empty() {
-            let _ = tx.send(SearchMessage::Done);
+            let _ = tx.send(SearchMessage::Done(SearchType::Fetch));
             return;
         }
 
@@ -348,7 +354,7 @@ impl SearchEngine {
             for h in handles {
                 let _ = h.join();
             }
-            let _ = tx.send(SearchMessage::Done);
+            let _ = tx.send(SearchMessage::Done(SearchType::Fetch));
         });
     }
 
