@@ -8,6 +8,8 @@ use crate::file_reader::{FileReader, detect_encoding, available_encodings};
 use crate::line_indexer::LineIndexer;
 use crate::search_engine::{SearchEngine, SearchResult};
 
+type SearchTaskResult = Result<(SearchEngine, PathBuf), String>;
+
 pub struct TextViewerApp {
     file_reader: Option<FileReader>,
     line_indexer: LineIndexer,
@@ -27,6 +29,9 @@ pub struct TextViewerApp {
     search_results: Vec<SearchResult>,
     current_result_index: usize,
     search_error: Option<String>,
+    search_in_progress: bool,
+    search_find_all: bool,
+    search_result_rx: Option<Receiver<SearchTaskResult>>,
     
     // Go to line
     goto_line_input: String,
@@ -45,10 +50,6 @@ pub struct TextViewerApp {
     // Encoding
     selected_encoding: &'static Encoding,
     show_encoding_selector: bool,
-    
-    // Selection state for copy-paste
-    selection_start: Option<(usize, usize)>, // (line, column)
-    selection_end: Option<(usize, usize)>,
     
     // Programmatic scroll control
     scroll_to_row: Option<usize>,
@@ -71,6 +72,9 @@ impl Default for TextViewerApp {
             search_results: Vec::new(),
             current_result_index: 0,
             search_error: None,
+            search_in_progress: false,
+            search_find_all: true,
+            search_result_rx: None,
             goto_line_input: String::new(),
             show_file_info: false,
             tail_mode: false,
@@ -79,8 +83,6 @@ impl Default for TextViewerApp {
             status_message: String::new(),
             selected_encoding: encoding_rs::UTF_8,
             show_encoding_selector: false,
-            selection_start: None,
-            selection_end: None,
             scroll_to_row: None,
         }
     }
@@ -93,6 +95,7 @@ impl TextViewerApp {
                 self.file_reader = Some(reader);
                 self.line_indexer.index_file(self.file_reader.as_ref().unwrap());
                 self.scroll_line = 0;
+                self.scroll_to_row = Some(0); // Reset scroll to top for new file
                 self.status_message = format!("Opened: {}", path.display());
                 self.search_engine.clear();
                 self.search_results.clear();
@@ -151,28 +154,98 @@ impl TextViewerApp {
         }
     }
 
-    fn perform_search(&mut self) {
+    fn perform_search(&mut self, find_all: bool) {
         self.search_error = None;
         self.search_results.clear();
         self.current_result_index = 0;
+        self.search_engine.clear();
 
-        if let Some(ref reader) = self.file_reader {
-            self.search_engine.set_query(self.search_query.clone(), self.use_regex);
-            
-            match self.search_engine.search(reader, 10000) {
-                Ok(_) => {
-                    self.search_results = self.search_engine.results().to_vec();
-                    if !self.search_results.is_empty() {
-                        let target_line = self.search_results[0].line_number; // Show first result at top
-                        self.scroll_line = target_line;
-                        self.scroll_to_row = Some(target_line);
-                        self.status_message = format!("Found {} matches", self.search_results.len());
-                    } else {
-                        self.status_message = "No matches found".to_string();
+        if self.search_in_progress {
+            self.status_message = "Search already running...".to_string();
+            return;
+        }
+
+        let Some(ref reader) = self.file_reader else {
+            self.status_message = "Open a file before searching".to_string();
+            return;
+        };
+
+        if self.search_query.is_empty() {
+            self.status_message = "Enter a search query first".to_string();
+            return;
+        }
+
+        let path = reader.path().clone();
+        let encoding = reader.encoding();
+        let query = self.search_query.clone();
+        let use_regex = self.use_regex;
+        let max_results = if find_all { usize::MAX } else { 1 };
+        let (tx, rx) = channel();
+
+        self.search_result_rx = Some(rx);
+        self.search_in_progress = true;
+        self.search_find_all = find_all;
+        self.status_message = if find_all {
+            "Searching all matches...".to_string()
+        } else {
+            "Searching first match...".to_string()
+        };
+
+        std::thread::spawn(move || {
+            let result: SearchTaskResult = (|| {
+                let file_reader = FileReader::new(path.clone(), encoding)
+                    .map_err(|e| format!("Error opening file: {}", e))?;
+
+                let mut engine = SearchEngine::new();
+                engine.set_query(query, use_regex);
+                engine.search(&file_reader, max_results)?;
+                Ok((engine, path))
+            })();
+
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_search_results(&mut self) {
+        if !self.search_in_progress {
+            return;
+        }
+
+        if let Some(ref rx) = self.search_result_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.search_in_progress = false;
+                self.search_result_rx = None;
+
+                match result {
+                    Ok((engine, path)) => {
+                        if let Some(ref reader) = self.file_reader {
+                            if reader.path() != &path {
+                                self.status_message = "Search finished but file changed; results ignored".to_string();
+                                return;
+                            }
+                        }
+
+                        self.search_engine = engine;
+                        self.search_results = self.search_engine.results().to_vec();
+                        let total = self.search_engine.total_results();
+
+                        if total > 0 {
+                            let target_line = self.search_results[0].line_number; // Show first result at top
+                            self.scroll_line = target_line;
+                            self.scroll_to_row = Some(target_line);
+                            if self.search_find_all {
+                                self.status_message = format!("Found {} matches", total);
+                            } else {
+                                self.status_message = "Showing first match. Run Find All to see every result.".to_string();
+                            }
+                        } else {
+                            self.status_message = "No matches found".to_string();
+                        }
                     }
-                }
-                Err(e) => {
-                    self.search_error = Some(e);
+                    Err(e) => {
+                        self.search_error = Some(e.clone());
+                        self.status_message = format!("Search failed: {}", e);
+                    }
                 }
             }
         }
@@ -290,11 +363,15 @@ impl TextViewerApp {
                 );
                 
                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    self.perform_search();
+                    self.perform_search(false);
                 }
                 
-                if ui.button("🔍 Find").clicked() {
-                    self.perform_search();
+                if ui.add_enabled(!self.search_in_progress, egui::Button::new("🔍 Find")).clicked() {
+                    self.perform_search(false);
+                }
+
+                if ui.add_enabled(!self.search_in_progress, egui::Button::new("🔎 Find All")).clicked() {
+                    self.perform_search(true);
                 }
                 
                 if ui.button("⬆ Previous").clicked() {
@@ -304,9 +381,17 @@ impl TextViewerApp {
                 if ui.button("⬇ Next").clicked() {
                     self.go_to_next_result();
                 }
+
+                if self.search_in_progress {
+                    ui.add(egui::Spinner::new().size(18.0));
+                    ui.label("Searching...");
+                }
                 
-                if !self.search_results.is_empty() {
-                    ui.label(format!("{}/{}", self.current_result_index + 1, self.search_results.len()));
+                let total_results = self.search_engine.total_results();
+                if total_results > 0 {
+                    // Show current position over total, even if we stored fewer than total
+                    let current = (self.current_result_index + 1).min(total_results);
+                    ui.label(format!("{}/{}", current, total_results));
                 }
                 
                 ui.separator();
@@ -361,15 +446,22 @@ impl TextViewerApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(ref reader) = self.file_reader {
                 let available_height = ui.available_height();
-                let line_height = self.font_size * 1.5;
-                self.visible_lines = (available_height / line_height) as usize + 2;
+                let font_id = egui::FontId::monospace(self.font_size);
+                let line_height = ui.fonts(|f| f.row_height(&font_id));
+                self.visible_lines = ((available_height / line_height).ceil() as usize).saturating_add(2);
 
                 let mut scroll_area = if self.wrap_mode {
                     egui::ScrollArea::vertical()
                 } else {
                     egui::ScrollArea::both()
                 }
-                    .id_salt("text_scroll_area")
+                    // Tie scroll memory to the current file path so new files start at the top
+                    .id_salt(
+                        self.file_reader
+                            .as_ref()
+                            .map(|r| r.path().display().to_string())
+                            .unwrap_or_else(|| "no_file".to_string())
+                    )
                     .auto_shrink([false, false])
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .drag_to_scroll(true);
@@ -396,30 +488,101 @@ impl TextViewerApp {
                                 if let Some((start, end)) = self.line_indexer.get_line_with_reader(line_num, reader) {
                                     let line_text = reader.get_chunk(start, end);
                                     let line_text = line_text.trim_end_matches('\n').trim_end_matches('\r');
+
+                                    // Collect matches that fall within this line's byte span; this works even with sparse line indexing
+                                    let mut line_matches: Vec<(usize, usize, bool)> = Vec::new();
+                                    for (idx, res) in self.search_results.iter().enumerate() {
+                                        if res.byte_offset < start || res.byte_offset >= end {
+                                            continue;
+                                        }
+
+                                        let rel_start = res.byte_offset.saturating_sub(start);
+                                        if rel_start >= line_text.len() {
+                                            continue;
+                                        }
+                                        let rel_end = (rel_start + res.match_text.len()).min(line_text.len());
+                                        line_matches.push((rel_start, rel_end, idx == self.current_result_index));
+                                    }
                                     
                                     ui.horizontal(|ui| {
                                         if self.show_line_numbers {
-                                            ui.label(
-                                                egui::RichText::new(format!("{:6} ", line_num + 1))
-                                                    .monospace()
-                                                    .color(egui::Color32::DARK_GRAY)
-                                            );
+                                            let ln_text = egui::RichText::new(format!("{:6} ", line_num + 1))
+                                                .monospace()
+                                                .color(egui::Color32::DARK_GRAY);
+                                            // Make line numbers non-selectable so drag-select only captures the content text
+                                            ui.add(egui::Label::new(ln_text).selectable(false));
                                         }
                                         
-                                        let mut text = egui::RichText::new(line_text)
-                                            .monospace()
-                                            .size(self.font_size);
-                                        
-                                        // Highlight search results
-                                        if self.search_results.iter().any(|r| r.line_number == line_num) {
-                                            text = text.background_color(egui::Color32::from_rgb(100, 100, 0));
-                                        }
-                                        
-                                        // Apply wrap mode
-                                        let label = if self.wrap_mode {
-                                            ui.add(egui::Label::new(text).wrap())
+                                        // Build label with highlighted search matches
+                                        let label = if !line_matches.is_empty() && !self.search_query.is_empty() {
+                                            // Create a LayoutJob to highlight matches within the line using their byte offsets
+                                            let mut job = egui::text::LayoutJob::default();
+                                            let mut last_end = 0;
+
+                                            for (abs_start, abs_end, is_selected) in line_matches.iter() {
+                                                if *abs_start > last_end {
+                                                    job.append(
+                                                        &line_text[last_end..*abs_start],
+                                                        0.0,
+                                                        egui::TextFormat {
+                                                            font_id: egui::FontId::monospace(self.font_size),
+                                                            color: if self.dark_mode { egui::Color32::LIGHT_GRAY } else { egui::Color32::BLACK },
+                                                            ..Default::default()
+                                                        },
+                                                    );
+                                                }
+
+                                                let match_end = (*abs_end).min(line_text.len());
+                                                job.append(
+                                                    &line_text[*abs_start..match_end],
+                                                    0.0,
+                                                    egui::TextFormat {
+                                                        font_id: egui::FontId::monospace(self.font_size),
+                                                        color: egui::Color32::BLACK,
+                                                        background: if *is_selected {
+                                                            egui::Color32::from_rgb(255, 200, 0) // orange-ish for current match
+                                                        } else {
+                                                            egui::Color32::YELLOW
+                                                        },
+                                                        ..Default::default()
+                                                    },
+                                                );
+
+                                                last_end = match_end;
+                                            }
+
+                                            // Add remaining text after last match
+                                            if last_end < line_text.len() {
+                                                job.append(
+                                                    &line_text[last_end..],
+                                                    0.0,
+                                                    egui::TextFormat {
+                                                        font_id: egui::FontId::monospace(self.font_size),
+                                                        color: if self.dark_mode { egui::Color32::LIGHT_GRAY } else { egui::Color32::BLACK },
+                                                        ..Default::default()
+                                                    },
+                                                );
+                                            }
+
+                                            if self.wrap_mode {
+                                                job.wrap = egui::text::TextWrapping {
+                                                    max_width: ui.available_width(),
+                                                    ..Default::default()
+                                                };
+                                            }
+
+                                            ui.add(egui::Label::new(job).extend())
                                         } else {
-                                            ui.add(egui::Label::new(text).extend())
+                                            let text = egui::RichText::new(line_text)
+                                                .monospace()
+                                                .size(self.font_size);
+                                            
+                                            // Apply wrap mode
+                                            if self.wrap_mode {
+                                                ui.add(egui::Label::new(text).wrap())
+                                            } else {
+                                                ui.add(egui::Label::new(text).extend())
+                                            }
                                         };
                                         
                                         // Enable text selection for copy-paste
@@ -515,6 +678,12 @@ impl eframe::App for TextViewerApp {
         if self.tail_mode {
             self.check_file_changes();
             ctx.request_repaint(); // Keep refreshing
+        }
+
+        self.poll_search_results();
+
+        if self.search_in_progress {
+            ctx.request_repaint(); // Keep spinner animated during long searches
         }
 
         self.render_menu_bar(ctx);

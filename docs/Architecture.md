@@ -8,7 +8,7 @@ This document describes the architecture and design decisions for the Large Text
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                         Main GUI (iced)                      │
+│                         Main GUI                      │
 │  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐       │
 │  │   Toolbar   │  │  Search Bar  │  │ Replace Bar  │       │
 │  └─────────────┘  └──────────────┘  └──────────────┘       │
