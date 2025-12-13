@@ -28,6 +28,7 @@ pub struct TextViewerApp {
     replace_query: String,
     show_replace: bool,
     use_regex: bool,
+    case_sensitive: bool,
     search_results: Vec<SearchResult>,
     current_result_index: usize, // Global index (0 to total_results - 1)
     total_search_results: usize,
@@ -71,6 +72,9 @@ pub struct TextViewerApp {
     // Correction for f32 scroll precision issues in large files
     scroll_correction: i64,
     pending_scroll_target: Option<usize>,
+    
+    // Focus control
+    focus_search_input: bool,
 }
 
 impl Default for TextViewerApp {
@@ -89,6 +93,7 @@ impl Default for TextViewerApp {
             replace_query: String::new(),
             show_replace: false,
             use_regex: false,
+            case_sensitive: false,
             search_results: Vec::new(),
             current_result_index: 0,
             total_search_results: 0,
@@ -114,6 +119,7 @@ impl Default for TextViewerApp {
             status_message: String::new(),
             selected_encoding: encoding_rs::UTF_8,
             show_encoding_selector: false,
+            focus_search_input: false,
             scroll_to_row: None,
             scroll_correction: 0,
             pending_scroll_target: None,
@@ -215,7 +221,7 @@ impl TextViewerApp {
             return;
         }
 
-        self.search_engine.set_query(self.search_query.clone(), self.use_regex);
+        self.search_engine.set_query(self.search_query.clone(), self.use_regex, self.case_sensitive);
 
         let reader = reader.clone();
         // Use a bounded channel to provide backpressure to search threads
@@ -246,12 +252,13 @@ impl TextViewerApp {
             let reader_count = reader.clone();
             let query = self.search_query.clone();
             let use_regex = self.use_regex;
+            let case_sensitive = self.case_sensitive;
             let cancel_token_count = cancel_token.clone();
             
             std::thread::spawn(move || {
                 // Task 1: Count
                 let mut engine = SearchEngine::new();
-                engine.set_query(query, use_regex);
+                engine.set_query(query, use_regex, case_sensitive);
                 engine.count_matches(reader_count, tx_count, cancel_token_count);
             });
             
@@ -263,7 +270,7 @@ impl TextViewerApp {
             std::thread::spawn(move || {
                 // Task 2: Fetch first page
                 let mut engine = SearchEngine::new();
-                engine.set_query(query_fetch, use_regex);
+                engine.set_query(query_fetch, use_regex, case_sensitive);
                 engine.fetch_matches(reader_fetch, tx_fetch, 0, 1000, cancel_token_fetch);
             });
             
@@ -273,11 +280,12 @@ impl TextViewerApp {
              let reader_fetch = reader.clone();
              let query = self.search_query.clone();
              let use_regex = self.use_regex;
+             let case_sensitive = self.case_sensitive;
              let cancel_token_fetch = cancel_token.clone();
              
              std::thread::spawn(move || {
                 let mut engine = SearchEngine::new();
-                engine.set_query(query, use_regex);
+                engine.set_query(query, use_regex, case_sensitive);
                 engine.fetch_matches(reader_fetch, tx_fetch, 0, 1, cancel_token_fetch);
             });
         }
@@ -654,6 +662,7 @@ impl TextViewerApp {
         let reader = reader.clone();
         let query = self.search_query.clone();
         let use_regex = self.use_regex;
+        let case_sensitive = self.case_sensitive;
         let (tx, rx) = std::sync::mpsc::sync_channel(10_000);
         self.search_message_rx = Some(rx);
         self.search_in_progress = true;
@@ -665,7 +674,7 @@ impl TextViewerApp {
         
         std::thread::spawn(move || {
             let mut engine = SearchEngine::new();
-            engine.set_query(query, use_regex);
+            engine.set_query(query, use_regex, case_sensitive);
             engine.fetch_matches(reader, tx, start_offset, 1000, cancel_token);
         });
     }
@@ -733,7 +742,8 @@ impl TextViewerApp {
 
                 ui.menu_button("Search", |ui| {
                     ui.checkbox(&mut self.use_regex, "Use Regex");
-                    if ui.checkbox(&mut self.show_replace, "Show Replace").changed() {
+                    ui.checkbox(&mut self.case_sensitive, "Match Case");
+                    if ui.checkbox(&mut self.show_replace, "Show Replace (Ctrl+R)").changed() {
                         // Reset replace state if hidden? No, keep it.
                     }
                 });
@@ -761,6 +771,14 @@ impl TextViewerApp {
                         .desired_width(300.0)
                 );
                 
+                if self.focus_search_input {
+                    response.request_focus();
+                    self.focus_search_input = false;
+                }
+                
+                ui.checkbox(&mut self.case_sensitive, "Aa").on_hover_text("Match Case");
+                ui.checkbox(&mut self.use_regex, ".*").on_hover_text("Use Regex");
+
                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     self.perform_search(false);
                 }
@@ -1166,6 +1184,14 @@ impl TextViewerApp {
 
 impl eframe::App for TextViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Handle keyboard shortcuts
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::R)) {
+            self.show_replace = !self.show_replace;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F)) {
+            self.focus_search_input = true;
+        }
+
         // Set theme
         if self.dark_mode {
             ctx.set_visuals(egui::Visuals::dark());
