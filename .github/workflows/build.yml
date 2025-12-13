@@ -61,13 +61,8 @@ jobs:
 
     - name: Run tests
       run: cargo test --release --verbose
-<<<<<<< Updated upstream:.github/workflows/build.yml
-    
-    - name: Upload binary
-=======
 
-    - name: Upload Windows binary
->>>>>>> Stashed changes:.github/workflows/build-windows.yml
+    - name: Upload executable artifact
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.asset_name }}

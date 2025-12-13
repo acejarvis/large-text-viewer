@@ -14,7 +14,7 @@ pub struct TextViewerApp {
     file_reader: Option<Arc<FileReader>>,
     line_indexer: LineIndexer,
     search_engine: SearchEngine,
-    
+
     // UI State
     scroll_line: usize,
     visible_lines: usize,
@@ -22,7 +22,7 @@ pub struct TextViewerApp {
     wrap_mode: bool,
     dark_mode: bool,
     show_line_numbers: bool,
-    
+
     // Search UI
     search_query: String,
     replace_query: String,
@@ -41,38 +41,39 @@ pub struct TextViewerApp {
     search_cancellation_token: Option<Arc<AtomicBool>>,
     search_count_done: bool,
     search_fetch_done: bool,
-    
+
     // Replace UI
     replace_in_progress: bool,
     replace_message_rx: Option<Receiver<ReplaceMessage>>,
     replace_cancellation_token: Option<Arc<AtomicBool>>,
     replace_progress: Option<f32>,
     replace_status_message: Option<String>,
-    
+
     // Go to line
     goto_line_input: String,
-    
+
     // File info
     show_file_info: bool,
-    
+
     // Tail mode
     tail_mode: bool,
     watcher: Option<Box<dyn Watcher>>,
     file_change_rx: Option<Receiver<()>>,
-    
+
     // Status messages
     status_message: String,
-    
+
     // Encoding
     selected_encoding: &'static Encoding,
     show_encoding_selector: bool,
-    
+
     // Programmatic scroll control
     scroll_to_row: Option<usize>,
     // Correction for f32 scroll precision issues in large files
     scroll_correction: i64,
     pending_scroll_target: Option<usize>,
-    
+    last_scroll_offset: f32,
+
     // Focus control
     focus_search_input: bool,
 }
@@ -123,6 +124,7 @@ impl Default for TextViewerApp {
             scroll_to_row: None,
             scroll_correction: 0,
             pending_scroll_target: None,
+            last_scroll_offset: 0.0,
         }
     }
 }
@@ -142,7 +144,7 @@ impl TextViewerApp {
                 self.search_page_start_index = 0;
                 self.page_offsets.clear();
                 self.current_result_index = 0;
-                
+
                 // Setup file watcher if tail mode is enabled
                 if self.tail_mode {
                     self.setup_file_watcher();
@@ -158,7 +160,7 @@ impl TextViewerApp {
         if let Some(ref reader) = self.file_reader {
             let (tx, rx) = channel();
             let path = reader.path().clone();
-            
+
             match notify::recommended_watcher(move |res: NotifyResult<notify::Event>| {
                 if let Ok(_event) = res {
                     let _ = tx.send(());
@@ -184,7 +186,7 @@ impl TextViewerApp {
                     let encoding = reader.encoding();
                     self.selected_encoding = encoding;
                     self.open_file(path);
-                    
+
                     // Scroll to bottom in tail mode
                     if self.tail_mode {
                         let total_lines = self.line_indexer.total_lines();
@@ -233,10 +235,10 @@ impl TextViewerApp {
         self.search_find_all = find_all;
         self.search_count_done = false;
         self.search_fetch_done = false;
-        
+
         let cancel_token = Arc::new(AtomicBool::new(false));
         self.search_cancellation_token = Some(cancel_token.clone());
-        
+
         self.status_message = if find_all {
             "Searching all matches...".to_string()
         } else {
@@ -247,33 +249,33 @@ impl TextViewerApp {
             // Start two tasks:
             // 1. Count all matches (parallel)
             // 2. Fetch first page of matches (sequential/chunked)
-            
+
             let tx_count = tx.clone();
             let reader_count = reader.clone();
             let query = self.search_query.clone();
             let use_regex = self.use_regex;
             let case_sensitive = self.case_sensitive;
             let cancel_token_count = cancel_token.clone();
-            
+
             std::thread::spawn(move || {
                 // Task 1: Count
                 let mut engine = SearchEngine::new();
                 engine.set_query(query, use_regex, case_sensitive);
                 engine.count_matches(reader_count, tx_count, cancel_token_count);
             });
-            
+
             let tx_fetch = tx.clone();
             let reader_fetch = reader.clone();
             let query_fetch = self.search_query.clone();
             let cancel_token_fetch = cancel_token.clone();
-            
+
             std::thread::spawn(move || {
                 // Task 2: Fetch first page
                 let mut engine = SearchEngine::new();
                 engine.set_query(query_fetch, use_regex, case_sensitive);
                 engine.fetch_matches(reader_fetch, tx_fetch, 0, 1000, cancel_token_fetch);
             });
-            
+
         } else {
             // Find first match only
              let tx_fetch = tx.clone();
@@ -282,7 +284,7 @@ impl TextViewerApp {
              let use_regex = self.use_regex;
              let case_sensitive = self.case_sensitive;
              let cancel_token_fetch = cancel_token.clone();
-             
+
              std::thread::spawn(move || {
                 let mut engine = SearchEngine::new();
                 engine.set_query(query, use_regex, case_sensitive);
@@ -311,7 +313,7 @@ impl TextViewerApp {
                         // Add results
                         self.search_results.extend(chunk_result.matches);
                         new_results_added = true;
-                        
+
                         // If we found results and haven't scrolled yet, scroll to the first one
                         if !self.search_results.is_empty() && self.scroll_to_row.is_none() && self.current_result_index == 0 {
                              // We need to sort at least once to find the true first result
@@ -326,7 +328,7 @@ impl TextViewerApp {
                             SearchType::Count => self.search_count_done = true,
                             SearchType::Fetch => self.search_fetch_done = true,
                         }
-                        
+
                         if self.search_find_all && self.search_count_done {
                              if self.search_results.len() == self.total_search_results {
                                  if let Some(token) = &self.search_cancellation_token {
@@ -344,20 +346,20 @@ impl TextViewerApp {
                     }
                 }
             }
-            
+
             // Check if channel is disconnected
             if let Err(std::sync::mpsc::TryRecvError::Disconnected) = rx.try_recv() {
                 self.search_in_progress = false;
                 self.search_message_rx = None;
-                
+
                 // Final sort to ensure everything is in order
                 self.search_results.sort_by_key(|r| r.byte_offset);
-                
+
                 // If we are in "Find All" mode, total_results should be at least search_results.len()
                 // But count task might be slower or faster.
                 // If count task finished, total_results is correct.
                 // If fetch task finished, search_results is populated.
-                
+
                 // If we are not finding all, total_results might be 0 (since we didn't run count task).
                 if !self.search_find_all {
                     self.total_search_results = self.search_results.len();
@@ -373,7 +375,7 @@ impl TextViewerApp {
                     } else {
                         self.status_message = "Showing first match. Run Find All to see every result.".to_string();
                     }
-                    
+
                     // Ensure we scroll to the first result if we haven't yet
                     if self.scroll_to_row.is_none() && !self.search_results.is_empty() {
                          let target_line = self.line_indexer.find_line_at_offset(self.search_results[0].byte_offset);
@@ -384,12 +386,12 @@ impl TextViewerApp {
                     self.status_message = "No matches found".to_string();
                 }
             }
-            
+
             if new_results_added {
                 // Sort results by byte offset to keep them in order
                 // Only sort once per frame after processing all available chunks
                 self.search_results.sort_by_key(|r| r.byte_offset);
-                
+
                 // Check for scroll update after sort
                 if self.scroll_to_row.is_none() && !self.search_results.is_empty() && self.current_result_index == 0 {
                      let target_line = self.line_indexer.find_line_at_offset(self.search_results[0].byte_offset);
@@ -440,28 +442,28 @@ impl TextViewerApp {
         if self.replace_in_progress {
             return;
         }
-        
+
         let Some(ref reader) = self.file_reader else { return };
         let input_path = reader.path().clone();
-        
+
         // Ask for output file
         if let Some(output_path) = rfd::FileDialog::new()
             .set_file_name(&format!("{}.modified", input_path.file_name().unwrap().to_string_lossy()))
-            .save_file() 
+            .save_file()
         {
             let query = self.search_query.clone();
             let replace_with = self.replace_query.clone();
             let use_regex = self.use_regex;
-            
+
             let (tx, rx) = std::sync::mpsc::channel();
             self.replace_message_rx = Some(rx);
             self.replace_in_progress = true;
             self.replace_progress = Some(0.0);
             self.replace_status_message = None;
-            
+
             let cancel_token = Arc::new(AtomicBool::new(false));
             self.replace_cancellation_token = Some(cancel_token.clone());
-            
+
             std::thread::spawn(move || {
                 Replacer::replace_all(
                     &input_path,
@@ -482,10 +484,10 @@ impl TextViewerApp {
         }
 
         let next_index = (self.current_result_index + 1) % self.total_search_results;
-        
+
         // Check if next_index is within current page
         let page_end_index = self.search_page_start_index + self.search_results.len();
-        
+
         if next_index >= self.search_page_start_index && next_index < page_end_index {
             // In current page
             self.current_result_index = next_index;
@@ -515,7 +517,7 @@ impl TextViewerApp {
                     // No, if we found a match at `byte_offset`, the next match must start after it (or overlapping if regex allows, but `find_iter` is non-overlapping).
                     // So `byte_offset + match_len` is the correct resume point for `find_iter`.
                     // But `fetch_matches` takes a `start_offset` and treats it as the beginning of the search.
-                    
+
                     // We should record the current page start offset before moving
                     if self.page_offsets.len() <= next_index / 1000 {
                          // This logic assumes pages are always 1000.
@@ -527,12 +529,12 @@ impl TextViewerApp {
                          // No, `page_offsets` stores the start offset of each page.
                          // Page 0: 0.
                          // Page 1: offset X.
-                         
+
                          // When we loaded Page 0, we didn't push 0 to `page_offsets`. We should.
                          if self.page_offsets.is_empty() {
                              self.page_offsets.push(0);
                          }
-                         
+
                          // Now we are moving to Page N+1.
                          // The start offset for Page N+1 is `last_result.byte_offset + last_result.match_len`?
                          // Or just `last_result.byte_offset + 1`?
@@ -541,7 +543,7 @@ impl TextViewerApp {
                          // If we pass a slice starting at `offset`, it finds matches in that slice.
                          // So yes, `last_result.byte_offset + 1` is safe, but `last_result.byte_offset + last_result.match_len` is more correct for non-overlapping.
                          // Let's use `last_result.byte_offset + 1` to be conservative.
-                         
+
                          let next_page_start_offset = last_result.byte_offset + 1;
                          // We might need to store this to `page_offsets`?
                          // We can store it when we successfully load the page?
@@ -549,7 +551,7 @@ impl TextViewerApp {
                          // But we don't know if we will find results.
                          // But we know `total_search_results` > `next_index`.
                     }
-                    
+
                     let start_offset = last_result.byte_offset + 1;
                     self.fetch_page(next_index, start_offset);
                 } else {
@@ -574,7 +576,7 @@ impl TextViewerApp {
 
         // Check if prev_index is within current page
         let page_end_index = self.search_page_start_index + self.search_results.len();
-        
+
         if prev_index >= self.search_page_start_index && prev_index < page_end_index {
             // In current page
             self.current_result_index = prev_index;
@@ -597,7 +599,7 @@ impl TextViewerApp {
                 // Let's just say "Cannot jump to end" or try to find it.
                 // Or, since we know `total_results`, we can try to find the last page.
                 // But we don't know where it starts.
-                
+
                 // For now, let's just reset to 0 if we can't find it?
                 // Or better: If we have `page_offsets` for the target page, use it.
                 // If not, maybe we shouldn't wrap?
@@ -611,7 +613,7 @@ impl TextViewerApp {
                 // We assume pages are 1000 items.
                 let target_page_idx = prev_index / 1000;
                 let target_page_start_index = target_page_idx * 1000;
-                
+
                 if let Some(&offset) = self.page_offsets.get(target_page_idx) {
                     self.fetch_page(target_page_start_index, offset);
                     self.current_result_index = prev_index;
@@ -622,10 +624,10 @@ impl TextViewerApp {
                     // So we should have it.
                     // But wait, `page_offsets` needs to be populated.
                     // I'll ensure `fetch_page` populates it.
-                    
+
                     // If we are at page 1 (1000-1999) and go back to 999 (page 0).
                     // We should have `page_offsets[0]`.
-                    
+
                     // Fallback: Search from 0?
                     self.fetch_page(0, 0);
                     self.current_result_index = 0; // Reset to 0 if lost
@@ -638,12 +640,12 @@ impl TextViewerApp {
         if self.search_in_progress {
             return;
         }
-        
+
         let Some(ref reader) = self.file_reader else { return };
-        
+
         self.search_results.clear();
         self.search_page_start_index = start_index;
-        
+
         // Update page_offsets
         let page_idx = start_index / 1000;
         if page_idx >= self.page_offsets.len() {
@@ -666,12 +668,12 @@ impl TextViewerApp {
         let (tx, rx) = std::sync::mpsc::sync_channel(10_000);
         self.search_message_rx = Some(rx);
         self.search_in_progress = true;
-        
+
         let cancel_token = Arc::new(AtomicBool::new(false));
         self.search_cancellation_token = Some(cancel_token.clone());
-        
+
         self.status_message = format!("Loading results {}...{}", start_index + 1, start_index + 1000);
-        
+
         std::thread::spawn(move || {
             let mut engine = SearchEngine::new();
             engine.set_query(query, use_regex, case_sensitive);
@@ -711,12 +713,12 @@ impl TextViewerApp {
                         }
                         ui.close_menu();
                     }
-                    
+
                     if ui.button("File Info").clicked() {
                         self.show_file_info = !self.show_file_info;
                         ui.close_menu();
                     }
-                    
+
                     if ui.button("Exit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -726,14 +728,14 @@ impl TextViewerApp {
                     ui.checkbox(&mut self.wrap_mode, "Word Wrap");
                     ui.checkbox(&mut self.show_line_numbers, "Line Numbers");
                     ui.checkbox(&mut self.dark_mode, "Dark Mode");
-                    
+
                     ui.separator();
-                    
+
                     ui.label("Font Size:");
                     ui.add(egui::Slider::new(&mut self.font_size, 8.0..=32.0));
-                    
+
                     ui.separator();
-                    
+
                     if ui.button("Select Encoding").clicked() {
                         self.show_encoding_selector = true;
                         ui.close_menu();
@@ -770,19 +772,19 @@ impl TextViewerApp {
                     egui::TextEdit::singleline(&mut self.search_query)
                         .desired_width(300.0)
                 );
-                
+
                 if self.focus_search_input {
                     response.request_focus();
                     self.focus_search_input = false;
                 }
-                
+
                 ui.checkbox(&mut self.case_sensitive, "Aa").on_hover_text("Match Case");
                 ui.checkbox(&mut self.use_regex, ".*").on_hover_text("Use Regex");
 
                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     self.perform_search(false);
                 }
-                
+
                 if ui.add_enabled(!self.search_in_progress, egui::Button::new("🔍 Find")).clicked() {
                     self.perform_search(false);
                 }
@@ -790,11 +792,11 @@ impl TextViewerApp {
                 if ui.add_enabled(!self.search_in_progress, egui::Button::new("🔎 Find All")).clicked() {
                     self.perform_search(true);
                 }
-                
+
                 if ui.button("⬆ Previous").clicked() {
                     self.go_to_previous_result();
                 }
-                
+
                 if ui.button("⬇ Next").clicked() {
                     self.go_to_next_result();
                 }
@@ -810,26 +812,26 @@ impl TextViewerApp {
                         self.status_message = "Search stopped by user".to_string();
                     }
                 }
-                
+
                 let total_results = self.total_search_results;
                 if total_results > 0 {
                     // Show current position over total
                     let current = (self.current_result_index + 1).min(total_results);
                     ui.label(format!("{}/{}", current, total_results));
                 }
-                
+
                 ui.separator();
-                
+
                 ui.label("Go to line:");
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.goto_line_input)
                         .desired_width(80.0)
                 );
-                
+
                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     self.go_to_line();
                 }
-                
+
                 if ui.button("Go").clicked() {
                     self.go_to_line();
                 }
@@ -861,12 +863,12 @@ impl TextViewerApp {
                         }
                     }
                 });
-                
+
                 if let Some(ref msg) = self.replace_status_message {
                     ui.label(msg);
                 }
             }
-            
+
             if let Some(ref error) = self.search_error {
                 ui.colored_label(egui::Color32::RED, format!("Search error: {}", error));
             }
@@ -889,7 +891,7 @@ impl TextViewerApp {
                 } else {
                     ui.label("No file opened - Click File → Open to start");
                 }
-                
+
                 if !self.status_message.is_empty() {
                     ui.separator();
                     ui.label(&self.status_message);
@@ -921,15 +923,17 @@ impl TextViewerApp {
                     .auto_shrink([false, false])
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .drag_to_scroll(true);
-                
+
                 // Apply programmatic scroll if requested
+                let mut programmatic_scroll = false;
                 if let Some(target_row) = self.scroll_to_row.take() {
                     scroll_area = scroll_area.vertical_scroll_offset(target_row as f32 * line_height);
+                    programmatic_scroll = true;
                 }
-                
+
                 let mut first_visible_row = None;
-                
-                scroll_area.show_rows(
+
+                let output = scroll_area.show_rows(
                         ui,
                         line_height,
                         self.line_indexer.total_lines(),
@@ -941,12 +945,12 @@ impl TextViewerApp {
 
                             // Apply correction to find the actual start line we want to render
                             let corrected_start_line = (row_range.start as i64 + self.scroll_correction).max(0) as usize;
-                            
+
                             // Capture the first visible row (corrected)
                             if first_visible_row.is_none() {
                                 first_visible_row = Some(corrected_start_line);
                             }
-                            
+
                             // For contiguous rendering, we find the start offset of the first line
                             // and then read sequentially.
                             let mut current_offset = if let Some((start, _)) = self.line_indexer.get_line_with_reader(corrected_start_line, reader) {
@@ -954,41 +958,41 @@ impl TextViewerApp {
                             } else {
                                 return;
                             };
-                            
+
                             // We iterate over the count of rows requested, but starting from our corrected line
                             let count = row_range.end - row_range.start;
                             let render_range = corrected_start_line..(corrected_start_line + count);
-                            
+
                             for line_num in render_range {
                                 // Read line starting at current_offset
                                 // We need to find the end of the line
                                 let chunk_size = 4096; // Read in chunks to find newline
                                 let mut line_end = current_offset;
                                 let mut found_newline = false;
-                                
+
                                 // Scan for newline
                                 while !found_newline {
                                     let chunk = reader.get_bytes(line_end, line_end + chunk_size);
                                     if chunk.is_empty() {
                                         break;
                                     }
-                                    
+
                                     if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
                                         line_end += pos + 1; // Include newline
                                         found_newline = true;
                                     } else {
                                         line_end += chunk.len();
                                     }
-                                    
+
                                     if line_end >= reader.len() {
                                         break;
                                     }
                                 }
-                                
+
                                 let start = current_offset;
                                 let end = line_end;
                                 current_offset = end; // Next line starts here
-                                
+
                                 if start >= reader.len() {
                                     break;
                                 }
@@ -998,11 +1002,11 @@ impl TextViewerApp {
 
                                 // Collect matches that fall within this line's byte span; this works even with sparse line indexing
                                 let mut line_matches: Vec<(usize, usize, bool)> = Vec::new();
-                                
+
                                 // Use binary search to find the first potential match
                                 // This assumes search_results is sorted by byte_offset
                                 let start_idx = self.search_results.partition_point(|r| r.byte_offset < start);
-                                
+
                                 for (idx, res) in self.search_results.iter().enumerate().skip(start_idx) {
                                     if res.byte_offset >= end {
                                         break;
@@ -1013,15 +1017,15 @@ impl TextViewerApp {
                                         continue;
                                     }
                                     let rel_end = (rel_start + res.match_len).min(line_text.len());
-                                    
+
                                     // Check if this is the currently selected result
                                     // We need to map local index to global index
                                     let global_idx = self.search_page_start_index + idx;
                                     let is_selected = global_idx == self.current_result_index;
-                                    
+
                                     line_matches.push((rel_start, rel_end, is_selected));
                                 }
-                                
+
                                 ui.horizontal(|ui| {
                                     if self.show_line_numbers {
                                         let ln_text = egui::RichText::new(format!("{:6} ", line_num + 1))
@@ -1030,7 +1034,7 @@ impl TextViewerApp {
                                         // Make line numbers non-selectable so drag-select only captures the content text
                                         ui.add(egui::Label::new(ln_text).selectable(false));
                                     }
-                                    
+
                                     // Build label with highlighted search matches
                                     let label = if !line_matches.is_empty() {
                                         // Create a LayoutJob to highlight matches within the line using their byte offsets
@@ -1094,7 +1098,7 @@ impl TextViewerApp {
                                         let text = egui::RichText::new(line_text)
                                             .monospace()
                                             .size(self.font_size);
-                                        
+
                                         // Apply wrap mode
                                         if self.wrap_mode {
                                             ui.add(egui::Label::new(text).wrap())
@@ -1102,19 +1106,28 @@ impl TextViewerApp {
                                             ui.add(egui::Label::new(text).extend())
                                         }
                                     };
-                                    
+
                                     // Enable text selection for copy-paste
                                     if label.hovered() {
                                         ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Text);
                                     }
-                                    
+
                                     // Ensure labels don't consume scroll events
                                     label.surrender_focus();
                                 });
                             }
                         },
                     );
-                
+
+                // Check for manual scroll
+                let current_offset = output.state.offset.y;
+                if !programmatic_scroll && (current_offset - self.last_scroll_offset).abs() > 1.0 {
+                    // Manual scroll detected (drag or wheel)
+                    // Reset correction as user is establishing new position
+                    self.scroll_correction = 0;
+                }
+                self.last_scroll_offset = current_offset;
+
                 // Update scroll_line to match what was actually displayed
                 if let Some(first_row) = first_visible_row {
                     self.scroll_line = first_row;
@@ -1140,17 +1153,17 @@ impl TextViewerApp {
                             name
                         ).clicked() {
                             self.selected_encoding = encoding;
-                            
+
                             // Reload file with new encoding
                             if let Some(ref reader) = self.file_reader {
                                 let path = reader.path().clone();
                                 self.open_file(path);
                             }
-                            
+
                             self.show_encoding_selector = false;
                         }
                     }
-                    
+
                     if ui.button("Cancel").clicked() {
                         self.show_encoding_selector = false;
                     }
@@ -1166,13 +1179,13 @@ impl TextViewerApp {
                     .resizable(false)
                     .show(ctx, |ui| {
                         ui.label(format!("Path: {}", reader.path().display()));
-                        ui.label(format!("Size: {} bytes ({:.2} MB)", 
-                            reader.len(), 
+                        ui.label(format!("Size: {} bytes ({:.2} MB)",
+                            reader.len(),
                             reader.len() as f64 / 1_000_000.0
                         ));
                         ui.label(format!("Lines: ~{}", self.line_indexer.total_lines()));
                         ui.label(format!("Encoding: {}", reader.encoding().name()));
-                        
+
                         if ui.button("Close").clicked() {
                             self.show_file_info = false;
                         }
