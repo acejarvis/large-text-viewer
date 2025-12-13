@@ -1,4 +1,4 @@
-name: Build Windows
+name: Build All Platforms
 
 on:
   pull_request:
@@ -6,19 +6,32 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: large-text-viewer
+            asset_name: large-text-viewer-linux
+          - os: windows-latest
+            artifact_name: large-text-viewer.exe
+            asset_name: large-text-viewer-windows
+          - os: macos-latest
+            artifact_name: large-text-viewer
+            asset_name: large-text-viewer-macos
     permissions:
       contents: read
-    
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
         toolchain: stable
-    
+
     - name: Cache cargo registry
       uses: actions/cache@v4
       with:
@@ -26,7 +39,7 @@ jobs:
         key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-cargo-registry-
-    
+
     - name: Cache cargo index
       uses: actions/cache@v4
       with:
@@ -34,7 +47,7 @@ jobs:
         key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-cargo-git-
-    
+
     - name: Cache target directory
       uses: actions/cache@v4
       with:
@@ -42,18 +55,23 @@ jobs:
         key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-target-
-    
+
     - name: Build release
       run: cargo build --release --verbose
-    
+
     - name: Run tests
       run: cargo test --release --verbose
+<<<<<<< Updated upstream:.github/workflows/build.yml
     
+    - name: Upload binary
+=======
+
     - name: Upload Windows binary
+>>>>>>> Stashed changes:.github/workflows/build-windows.yml
       uses: actions/upload-artifact@v4
       with:
-        name: large-text-viewer-windows
-        path: target/release/large-text-viewer.exe
+        name: ${{ matrix.asset_name }}
+        path: target/release/${{ matrix.artifact_name }}
         if-no-files-found: error
         retention-days: 5
 

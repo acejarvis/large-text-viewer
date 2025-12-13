@@ -1,0 +1,29 @@
+name: CLOC Analysis
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  cloc:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+          
+      - name: Install CLOC
+        run: sudo apt-get update && sudo apt-get install -y cloc
+          
+      - name: Run CLOC on Rust code
+        run: |
+          echo "## CLOC Analysis Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cloc --md --include-lang=Rust . | tee -a $GITHUB_STEP_SUMMARY
+              
+      - name: Run CLOC on all code
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Full Repository Analysis" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cloc --md . | tee -a $GITHUB_STEP_SUMMARY
