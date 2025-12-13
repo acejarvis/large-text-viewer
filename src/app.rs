@@ -506,11 +506,11 @@ impl TextViewerApp {
                                     
                                     ui.horizontal(|ui| {
                                         if self.show_line_numbers {
-                                            ui.label(
-                                                egui::RichText::new(format!("{:6} ", line_num + 1))
-                                                    .monospace()
-                                                    .color(egui::Color32::DARK_GRAY)
-                                            );
+                                            let ln_text = egui::RichText::new(format!("{:6} ", line_num + 1))
+                                                .monospace()
+                                                .color(egui::Color32::DARK_GRAY);
+                                            // Make line numbers non-selectable so drag-select only captures the content text
+                                            ui.add(egui::Label::new(ln_text).selectable(false));
                                         }
                                         
                                         // Build label with highlighted search matches
