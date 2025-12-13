@@ -6,6 +6,7 @@ use std::thread;
 pub struct SearchEngine {
     query: String,
     use_regex: bool,
+    case_sensitive: bool,
     regex: Option<Regex>,
     results: Vec<SearchResult>,
     total_results: usize,
@@ -39,22 +40,33 @@ impl SearchEngine {
         Self {
             query: String::new(),
             use_regex: false,
+            case_sensitive: false,
             regex: None,
             results: Vec::new(),
             total_results: 0,
         }
     }
 
-    pub fn set_query(&mut self, query: String, use_regex: bool) {
+    pub fn set_query(&mut self, query: String, use_regex: bool, case_sensitive: bool) {
         self.query = query;
         self.use_regex = use_regex;
+        self.case_sensitive = case_sensitive;
         
-        if use_regex {
-            self.regex = Regex::new(&self.query).ok();
+        let pattern = if use_regex {
+            if !case_sensitive {
+                format!("(?i){}", self.query)
+            } else {
+                self.query.clone()
+            }
         } else {
-            let pattern = format!("(?i){}", regex::escape(&self.query));
-            self.regex = Regex::new(&pattern).ok();
-        }
+            if !case_sensitive {
+                format!("(?i){}", regex::escape(&self.query))
+            } else {
+                regex::escape(&self.query)
+            }
+        };
+
+        self.regex = Regex::new(&pattern).ok();
         
         self.results.clear();
     }
