@@ -1,17 +1,16 @@
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 use notify::{Watcher, RecursiveMode, Result as NotifyResult};
 use encoding_rs::Encoding;
 
 use crate::file_reader::{FileReader, detect_encoding, available_encodings};
 use crate::line_indexer::LineIndexer;
-use crate::search_engine::{SearchEngine, SearchResult};
-
-type SearchTaskResult = Result<(SearchEngine, PathBuf), String>;
+use crate::search_engine::{SearchEngine, SearchResult, SearchMessage};
 
 pub struct TextViewerApp {
-    file_reader: Option<FileReader>,
+    file_reader: Option<Arc<FileReader>>,
     line_indexer: LineIndexer,
     search_engine: SearchEngine,
     
@@ -31,7 +30,7 @@ pub struct TextViewerApp {
     search_error: Option<String>,
     search_in_progress: bool,
     search_find_all: bool,
-    search_result_rx: Option<Receiver<SearchTaskResult>>,
+    search_message_rx: Option<Receiver<SearchMessage>>,
     
     // Go to line
     goto_line_input: String,
@@ -74,7 +73,7 @@ impl Default for TextViewerApp {
             search_error: None,
             search_in_progress: false,
             search_find_all: true,
-            search_result_rx: None,
+            search_message_rx: None,
             goto_line_input: String::new(),
             show_file_info: false,
             tail_mode: false,
@@ -92,7 +91,7 @@ impl TextViewerApp {
     fn open_file(&mut self, path: PathBuf) {
         match FileReader::new(path.clone(), self.selected_encoding) {
             Ok(reader) => {
-                self.file_reader = Some(reader);
+                self.file_reader = Some(Arc::new(reader));
                 self.line_indexer.index_file(self.file_reader.as_ref().unwrap());
                 self.scroll_line = 0;
                 self.scroll_to_row = Some(0); // Reset scroll to top for new file
@@ -175,14 +174,15 @@ impl TextViewerApp {
             return;
         }
 
-        let path = reader.path().clone();
-        let encoding = reader.encoding();
+        let reader = reader.clone();
         let query = self.search_query.clone();
         let use_regex = self.use_regex;
         let max_results = if find_all { usize::MAX } else { 1 };
-        let (tx, rx) = channel();
+        // Use a bounded channel to provide backpressure to search threads
+        // This prevents memory explosion if the UI thread can't keep up with results
+        let (tx, rx) = std::sync::mpsc::sync_channel(10_000);
 
-        self.search_result_rx = Some(rx);
+        self.search_message_rx = Some(rx);
         self.search_in_progress = true;
         self.search_find_all = find_all;
         self.status_message = if find_all {
@@ -191,19 +191,13 @@ impl TextViewerApp {
             "Searching first match...".to_string()
         };
 
-        std::thread::spawn(move || {
-            let result: SearchTaskResult = (|| {
-                let file_reader = FileReader::new(path.clone(), encoding)
-                    .map_err(|e| format!("Error opening file: {}", e))?;
-
-                let mut engine = SearchEngine::new();
-                engine.set_query(query, use_regex);
-                engine.search(&file_reader, max_results)?;
-                Ok((engine, path))
-            })();
-
-            let _ = tx.send(result);
-        });
+        self.search_engine.set_query(query, use_regex);
+        
+        // Correct approach:
+        // 1. Configure the search engine on the main thread (already done with set_query)
+        // 2. Call search_parallel which spawns threads and returns immediately
+        
+        self.search_engine.search_parallel(reader, tx, max_results);
     }
 
     fn poll_search_results(&mut self) {
@@ -211,41 +205,74 @@ impl TextViewerApp {
             return;
         }
 
-        if let Some(ref rx) = self.search_result_rx {
-            if let Ok(result) = rx.try_recv() {
-                self.search_in_progress = false;
-                self.search_result_rx = None;
-
-                match result {
-                    Ok((engine, path)) => {
-                        if let Some(ref reader) = self.file_reader {
-                            if reader.path() != &path {
-                                self.status_message = "Search finished but file changed; results ignored".to_string();
-                                return;
-                            }
+        if let Some(ref rx) = self.search_message_rx {
+            let mut new_results_added = false;
+            // Process all available messages
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    SearchMessage::ChunkResult(chunk_result) => {
+                        // Add results
+                        self.search_results.extend(chunk_result.matches);
+                        new_results_added = true;
+                        
+                        let total = self.search_results.len();
+                        self.status_message = format!("Found {} matches...", total);
+                        
+                        // If we found results and haven't scrolled yet, scroll to the first one
+                        if total > 0 && self.scroll_to_row.is_none() && self.current_result_index == 0 {
+                             // We need to sort at least once to find the true first result
+                             // But doing it here might be expensive if we do it often.
+                             // For the very first result, we can just check if we have any.
+                             // However, to be correct, we should probably wait or do a partial check.
+                             // For now, let's defer the sort to outside the loop.
                         }
-
-                        self.search_engine = engine;
-                        self.search_results = self.search_engine.results().to_vec();
-                        let total = self.search_engine.total_results();
-
+                    }
+                    SearchMessage::Done => {
+                        self.search_in_progress = false;
+                        self.search_message_rx = None;
+                        
+                        // Final sort to ensure everything is in order
+                        self.search_results.sort_by_key(|r| r.byte_offset);
+                        
+                        let total = self.search_results.len();
                         if total > 0 {
-                            let target_line = self.search_results[0].line_number; // Show first result at top
-                            self.scroll_line = target_line;
-                            self.scroll_to_row = Some(target_line);
                             if self.search_find_all {
                                 self.status_message = format!("Found {} matches", total);
                             } else {
                                 self.status_message = "Showing first match. Run Find All to see every result.".to_string();
                             }
+                            
+                            // Ensure we scroll to the first result if we haven't yet
+                            if self.scroll_to_row.is_none() {
+                                 let target_line = self.line_indexer.find_line_at_offset(self.search_results[0].byte_offset);
+                                 self.scroll_line = target_line;
+                                 self.scroll_to_row = Some(target_line);
+                            }
                         } else {
                             self.status_message = "No matches found".to_string();
                         }
+                        return; // Stop processing messages
                     }
-                    Err(e) => {
+                    SearchMessage::Error(e) => {
+                        self.search_in_progress = false;
+                        self.search_message_rx = None;
                         self.search_error = Some(e.clone());
                         self.status_message = format!("Search failed: {}", e);
+                        return; // Stop processing messages
                     }
+                }
+            }
+            
+            if new_results_added {
+                // Sort results by byte offset to keep them in order
+                // Only sort once per frame after processing all available chunks
+                self.search_results.sort_by_key(|r| r.byte_offset);
+                
+                // Check for scroll update after sort
+                if self.scroll_to_row.is_none() && !self.search_results.is_empty() && self.current_result_index == 0 {
+                     let target_line = self.line_indexer.find_line_at_offset(self.search_results[0].byte_offset);
+                     self.scroll_line = target_line;
+                     self.scroll_to_row = Some(target_line);
                 }
             }
         }
@@ -255,7 +282,7 @@ impl TextViewerApp {
         if !self.search_results.is_empty() {
             self.current_result_index = (self.current_result_index + 1) % self.search_results.len();
             let result = &self.search_results[self.current_result_index];
-            let target_line = result.line_number; // Show search result line at top
+            let target_line = self.line_indexer.find_line_at_offset(result.byte_offset);
             self.scroll_line = target_line;
             self.scroll_to_row = Some(target_line);
         }
@@ -269,7 +296,7 @@ impl TextViewerApp {
                 self.current_result_index - 1
             };
             let result = &self.search_results[self.current_result_index];
-            let target_line = result.line_number; // Show search result line at top
+            let target_line = self.line_indexer.find_line_at_offset(result.byte_offset);
             self.scroll_line = target_line;
             self.scroll_to_row = Some(target_line);
         }
@@ -387,7 +414,7 @@ impl TextViewerApp {
                     ui.label("Searching...");
                 }
                 
-                let total_results = self.search_engine.total_results();
+                let total_results = self.search_results.len();
                 if total_results > 0 {
                     // Show current position over total, even if we stored fewer than total
                     let current = (self.current_result_index + 1).min(total_results);
@@ -491,16 +518,21 @@ impl TextViewerApp {
 
                                     // Collect matches that fall within this line's byte span; this works even with sparse line indexing
                                     let mut line_matches: Vec<(usize, usize, bool)> = Vec::new();
-                                    for (idx, res) in self.search_results.iter().enumerate() {
-                                        if res.byte_offset < start || res.byte_offset >= end {
-                                            continue;
+                                    
+                                    // Use binary search to find the first potential match
+                                    // This assumes search_results is sorted by byte_offset
+                                    let start_idx = self.search_results.partition_point(|r| r.byte_offset < start);
+                                    
+                                    for (idx, res) in self.search_results.iter().enumerate().skip(start_idx) {
+                                        if res.byte_offset >= end {
+                                            break;
                                         }
 
                                         let rel_start = res.byte_offset.saturating_sub(start);
                                         if rel_start >= line_text.len() {
                                             continue;
                                         }
-                                        let rel_end = (rel_start + res.match_text.len()).min(line_text.len());
+                                        let rel_end = (rel_start + res.match_len).min(line_text.len());
                                         line_matches.push((rel_start, rel_end, idx == self.current_result_index));
                                     }
                                     
@@ -514,7 +546,7 @@ impl TextViewerApp {
                                         }
                                         
                                         // Build label with highlighted search matches
-                                        let label = if !line_matches.is_empty() && !self.search_query.is_empty() {
+                                        let label = if !line_matches.is_empty() {
                                             // Create a LayoutJob to highlight matches within the line using their byte offsets
                                             let mut job = egui::text::LayoutJob::default();
                                             let mut last_end = 0;

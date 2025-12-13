@@ -1,5 +1,7 @@
 use regex::Regex;
 use crate::file_reader::FileReader;
+use std::sync::{Arc, mpsc::SyncSender};
+use std::thread;
 
 pub struct SearchEngine {
     query: String,
@@ -11,11 +13,18 @@ pub struct SearchEngine {
 
 #[derive(Clone, Debug)]
 pub struct SearchResult {
-    #[allow(dead_code)]
     pub byte_offset: usize,
-    pub line_number: usize,
-    #[allow(dead_code)]
-    pub match_text: String,
+    pub match_len: usize,
+}
+
+pub struct ChunkSearchResult {
+    pub matches: Vec<SearchResult>,
+}
+
+pub enum SearchMessage {
+    ChunkResult(ChunkSearchResult),
+    Done,
+    Error(String),
 }
 
 impl SearchEngine {
@@ -36,12 +45,115 @@ impl SearchEngine {
         if use_regex {
             self.regex = Regex::new(&self.query).ok();
         } else {
-            self.regex = None;
+            let pattern = format!("(?i){}", regex::escape(&self.query));
+            self.regex = Regex::new(&pattern).ok();
         }
         
         self.results.clear();
     }
 
+    pub fn search_parallel(
+        &self,
+        reader: Arc<FileReader>,
+        tx: SyncSender<SearchMessage>,
+        _max_results: usize,
+    ) {
+        let file_len = reader.len();
+        if file_len == 0 || self.query.is_empty() {
+            let _ = tx.send(SearchMessage::Done);
+            return;
+        }
+
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+
+        let chunk_size = (file_len + num_threads - 1) / num_threads;
+        let query_len = self.query.len();
+        let overlap = query_len.saturating_sub(1).max(1000);
+
+        let regex = self.regex.clone();
+
+        thread::spawn(move || {
+            let mut handles = vec![];
+
+            for i in 0..num_threads {
+                let thread_start = i * chunk_size;
+                if thread_start >= file_len {
+                    break;
+                }
+                let thread_end = (thread_start + chunk_size).min(file_len);
+                
+                let reader_clone = reader.clone();
+                let tx_clone = tx.clone();
+                let regex_clone = regex.clone();
+
+                let handle = thread::spawn(move || {
+                    if let Some(regex) = regex_clone {
+                        let mut pos = thread_start;
+                        // Process in smaller batches to avoid high memory usage
+                        const BATCH_SIZE: usize = 4 * 1024 * 1024; // 4MB
+
+                        while pos < thread_end {
+                            let batch_end = (pos + BATCH_SIZE).min(thread_end);
+                            // Add overlap to catch matches crossing batch boundaries
+                            let read_end = (batch_end + overlap).min(file_len);
+                            
+                            let chunk_bytes = reader_clone.get_bytes(pos, read_end);
+                            let chunk_text = match std::str::from_utf8(chunk_bytes) {
+                                Ok(t) => t.to_string(),
+                                Err(_) => {
+                                    let (cow, _, _) = reader_clone.encoding().decode(chunk_bytes);
+                                    cow.into_owned()
+                                }
+                            };
+
+                            let mut local_matches = Vec::new();
+                            
+                            for mat in regex.find_iter(&chunk_text) {
+                                let match_start = mat.start();
+                                let absolute_start = pos + match_start;
+                                
+                                // Only accept matches starting in [pos, batch_end)
+                                // Matches starting >= batch_end will be handled by the next batch (thanks to overlap)
+                                if absolute_start >= batch_end {
+                                    continue;
+                                }
+                                
+                                local_matches.push(SearchResult {
+                                    byte_offset: absolute_start,
+                                    match_len: mat.end() - mat.start(),
+                                });
+                            }
+                            
+                            if !local_matches.is_empty() {
+                                // This will block if the channel is full, providing backpressure
+                                if tx_clone.send(SearchMessage::ChunkResult(ChunkSearchResult {
+                                    matches: local_matches,
+                                })).is_err() {
+                                    // Receiver dropped, stop searching
+                                    return;
+                                }
+                            }
+
+                            pos = batch_end;
+                        }
+                    } else {
+                         let _ = tx_clone.send(SearchMessage::Error("Invalid regex".to_string()));
+                    }
+                });
+                handles.push(handle);
+            }
+
+            for h in handles {
+                let _ = h.join();
+            }
+            let _ = tx.send(SearchMessage::Done);
+        });
+    }
+
+    #[allow(dead_code)]
     pub fn search(&mut self, reader: &FileReader, max_results: usize) -> Result<(), String> {
         self.results.clear();
 
@@ -55,6 +167,7 @@ impl SearchEngine {
         self.search_chunked(reader, max_results)
     }
 
+    #[allow(dead_code)]
     fn search_chunked(&mut self, reader: &FileReader, max_results: usize) -> Result<(), String> {
         const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10 MB chunks
         let file_len = reader.len();
@@ -80,11 +193,7 @@ impl SearchEngine {
             };
             
             // Search in this chunk
-            if self.use_regex {
-                self.search_chunk_regex(&chunk_text, chunk_start, &mut line_number, max_results)?;
-            } else {
-                self.search_chunk_simple(&chunk_text, chunk_start, &mut line_number, max_results);
-            }
+            self.search_chunk_regex(&chunk_text, chunk_start, &mut line_number, max_results)?;
             
             // Move to next chunk with overlap
             if chunk_end >= file_len {
@@ -108,55 +217,7 @@ impl SearchEngine {
         Ok(())
     }
 
-    fn search_chunk_simple(
-        &mut self,
-        chunk_text: &str,
-        chunk_offset: usize,
-        line_number: &mut usize,
-        max_results: usize,
-    ) {
-        let query_lower = self.query.to_lowercase();
-        let chunk_lower = chunk_text.to_lowercase();
-        let mut pos = 0;
-        let mut current_line = *line_number;
-        let mut last_newline = 0;
-        
-        while let Some(match_pos) = chunk_lower[pos..].find(&query_lower) {
-            let absolute_pos = pos + match_pos;
-            
-            // Count newlines up to this position (byte-based iteration)
-            for ch in chunk_text[last_newline..absolute_pos].chars() {
-                if ch == '\n' {
-                    current_line += 1;
-                }
-            }
-            last_newline = absolute_pos;
-            
-            // Extract actual match text (preserve case)
-            let match_text = chunk_text[absolute_pos..absolute_pos.min(absolute_pos + self.query.len())].to_string();
-            
-            // Count every match, even if we stop storing due to max_results
-            self.total_results += 1;
-
-            if self.results.len() < max_results {
-                self.results.push(SearchResult {
-                    byte_offset: chunk_offset + absolute_pos,
-                    line_number: current_line,
-                    match_text,
-                });
-            }
-            
-            if self.results.len() >= max_results {
-                break;
-            }
-            
-            pos = absolute_pos + 1;
-        }
-        
-        // Update line number for remaining chunk
-        *line_number = current_line + chunk_text[last_newline..].lines().count().saturating_sub(1);
-    }
-
+    #[allow(dead_code)]
     fn search_chunk_regex(
         &mut self,
         chunk_text: &str,
@@ -187,8 +248,7 @@ impl SearchEngine {
                 if self.results.len() < max_results {
                     self.results.push(SearchResult {
                         byte_offset: chunk_offset + mat.start(),
-                        line_number: current_line,
-                        match_text: mat.as_str().to_string(),
+                        match_len: mat.end() - mat.start(),
                     });
                 }
             }
@@ -202,10 +262,12 @@ impl SearchEngine {
         }
     }
 
+    #[allow(dead_code)]
     pub fn results(&self) -> &[SearchResult] {
         &self.results
     }
 
+    #[allow(dead_code)]
     pub fn total_results(&self) -> usize {
         self.total_results
     }

@@ -181,9 +181,19 @@ impl LineIndexer {
 
     #[allow(dead_code)]
     pub fn find_line_at_offset(&self, offset: usize) -> usize {
-        match self.line_offsets.binary_search(&offset) {
-            Ok(line) => line,
-            Err(line) => line.saturating_sub(1),
+        if self.sample_interval == 0 {
+            // Full index
+            match self.line_offsets.binary_search(&offset) {
+                Ok(line) => line,
+                Err(line) => line.saturating_sub(1),
+            }
+        } else {
+            // Sparse index - estimate
+            if self.avg_line_length > 0.0 {
+                (offset as f64 / self.avg_line_length) as usize
+            } else {
+                offset / 80
+            }
         }
     }
 
