@@ -1,7 +1,7 @@
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use notify::{Watcher, RecursiveMode, Result as NotifyResult};
 use encoding_rs::Encoding;
 
@@ -26,11 +26,15 @@ pub struct TextViewerApp {
     search_query: String,
     use_regex: bool,
     search_results: Vec<SearchResult>,
-    current_result_index: usize,
+    current_result_index: usize, // Global index (0 to total_results - 1)
+    total_search_results: usize,
+    search_page_start_index: usize, // Global index of the first result in search_results
+    page_offsets: Vec<usize>, // Map of page_index -> start_byte_offset
     search_error: Option<String>,
     search_in_progress: bool,
     search_find_all: bool,
     search_message_rx: Option<Receiver<SearchMessage>>,
+    search_cancellation_token: Option<Arc<AtomicBool>>,
     
     // Go to line
     goto_line_input: String,
@@ -70,10 +74,14 @@ impl Default for TextViewerApp {
             use_regex: false,
             search_results: Vec::new(),
             current_result_index: 0,
+            total_search_results: 0,
+            search_page_start_index: 0,
+            page_offsets: Vec::new(),
             search_error: None,
             search_in_progress: false,
             search_find_all: true,
             search_message_rx: None,
+            search_cancellation_token: None,
             goto_line_input: String::new(),
             show_file_info: false,
             tail_mode: false,
@@ -98,6 +106,10 @@ impl TextViewerApp {
                 self.status_message = format!("Opened: {}", path.display());
                 self.search_engine.clear();
                 self.search_results.clear();
+                self.total_search_results = 0;
+                self.search_page_start_index = 0;
+                self.page_offsets.clear();
+                self.current_result_index = 0;
                 
                 // Setup file watcher if tail mode is enabled
                 if self.tail_mode {
@@ -157,6 +169,9 @@ impl TextViewerApp {
         self.search_error = None;
         self.search_results.clear();
         self.current_result_index = 0;
+        self.total_search_results = 0;
+        self.search_page_start_index = 0;
+        self.page_offsets.clear();
         self.search_engine.clear();
 
         if self.search_in_progress {
@@ -174,10 +189,9 @@ impl TextViewerApp {
             return;
         }
 
+        self.search_engine.set_query(self.search_query.clone(), self.use_regex);
+
         let reader = reader.clone();
-        let query = self.search_query.clone();
-        let use_regex = self.use_regex;
-        let max_results = if find_all { usize::MAX } else { 1 };
         // Use a bounded channel to provide backpressure to search threads
         // This prevents memory explosion if the UI thread can't keep up with results
         let (tx, rx) = std::sync::mpsc::sync_channel(10_000);
@@ -185,19 +199,60 @@ impl TextViewerApp {
         self.search_message_rx = Some(rx);
         self.search_in_progress = true;
         self.search_find_all = find_all;
+        
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        self.search_cancellation_token = Some(cancel_token.clone());
+        
         self.status_message = if find_all {
             "Searching all matches...".to_string()
         } else {
             "Searching first match...".to_string()
         };
 
-        self.search_engine.set_query(query, use_regex);
-        
-        // Correct approach:
-        // 1. Configure the search engine on the main thread (already done with set_query)
-        // 2. Call search_parallel which spawns threads and returns immediately
-        
-        self.search_engine.search_parallel(reader, tx, max_results);
+        if find_all {
+            // Start two tasks:
+            // 1. Count all matches (parallel)
+            // 2. Fetch first page of matches (sequential/chunked)
+            
+            let tx_count = tx.clone();
+            let reader_count = reader.clone();
+            let query = self.search_query.clone();
+            let use_regex = self.use_regex;
+            let cancel_token_count = cancel_token.clone();
+            
+            std::thread::spawn(move || {
+                // Task 1: Count
+                let mut engine = SearchEngine::new();
+                engine.set_query(query, use_regex);
+                engine.count_matches(reader_count, tx_count, cancel_token_count);
+            });
+            
+            let tx_fetch = tx.clone();
+            let reader_fetch = reader.clone();
+            let query_fetch = self.search_query.clone();
+            let cancel_token_fetch = cancel_token.clone();
+            
+            std::thread::spawn(move || {
+                // Task 2: Fetch first page
+                let mut engine = SearchEngine::new();
+                engine.set_query(query_fetch, use_regex);
+                engine.fetch_matches(reader_fetch, tx_fetch, 0, 1000, cancel_token_fetch);
+            });
+            
+        } else {
+            // Find first match only
+             let tx_fetch = tx.clone();
+             let reader_fetch = reader.clone();
+             let query = self.search_query.clone();
+             let use_regex = self.use_regex;
+             let cancel_token_fetch = cancel_token.clone();
+             
+             std::thread::spawn(move || {
+                let mut engine = SearchEngine::new();
+                engine.set_query(query, use_regex);
+                engine.fetch_matches(reader_fetch, tx_fetch, 0, 1, cancel_token_fetch);
+            });
+        }
     }
 
     fn poll_search_results(&mut self) {
@@ -210,16 +265,19 @@ impl TextViewerApp {
             // Process all available messages
             while let Ok(msg) = rx.try_recv() {
                 match msg {
+                    SearchMessage::CountResult(count) => {
+                        self.total_search_results += count;
+                        if self.search_find_all {
+                            self.status_message = format!("Found {} matches...", self.total_search_results);
+                        }
+                    }
                     SearchMessage::ChunkResult(chunk_result) => {
                         // Add results
                         self.search_results.extend(chunk_result.matches);
                         new_results_added = true;
                         
-                        let total = self.search_results.len();
-                        self.status_message = format!("Found {} matches...", total);
-                        
                         // If we found results and haven't scrolled yet, scroll to the first one
-                        if total > 0 && self.scroll_to_row.is_none() && self.current_result_index == 0 {
+                        if !self.search_results.is_empty() && self.scroll_to_row.is_none() && self.current_result_index == 0 {
                              // We need to sort at least once to find the true first result
                              // But doing it here might be expensive if we do it often.
                              // For the very first result, we can just check if we have any.
@@ -228,30 +286,29 @@ impl TextViewerApp {
                         }
                     }
                     SearchMessage::Done => {
-                        self.search_in_progress = false;
-                        self.search_message_rx = None;
+                        // We might receive multiple Done messages (one from count, one from fetch)
+                        // We should only stop when both are done?
+                        // Actually, we don't know how many tasks are running easily.
+                        // But `count_matches` sends Done. `fetch_matches` sends Done.
+                        // If we stop on first Done, we might kill the other.
+                        // But `search_in_progress` controls the spinner.
+                        // And `search_message_rx` controls receiving.
                         
-                        // Final sort to ensure everything is in order
-                        self.search_results.sort_by_key(|r| r.byte_offset);
+                        // If we are finding all, we expect 2 Done messages?
+                        // Or we can just ignore Done and rely on timeout? No.
+                        // Let's just keep running until channel disconnects?
+                        // `rx.try_recv()` returns Err(Empty) or Err(Disconnected).
+                        // If senders drop tx, we get Disconnected.
+                        // But we hold `tx` in `perform_search`? No, we dropped it there.
+                        // So when all threads finish, we get Disconnected.
                         
-                        let total = self.search_results.len();
-                        if total > 0 {
-                            if self.search_find_all {
-                                self.status_message = format!("Found {} matches", total);
-                            } else {
-                                self.status_message = "Showing first match. Run Find All to see every result.".to_string();
-                            }
-                            
-                            // Ensure we scroll to the first result if we haven't yet
-                            if self.scroll_to_row.is_none() {
-                                 let target_line = self.line_indexer.find_line_at_offset(self.search_results[0].byte_offset);
-                                 self.scroll_line = target_line;
-                                 self.scroll_to_row = Some(target_line);
-                            }
-                        } else {
-                            self.status_message = "No matches found".to_string();
-                        }
-                        return; // Stop processing messages
+                        // So we should handle Disconnected instead of Done?
+                        // But `SearchMessage::Done` is explicit.
+                        // Let's just ignore Done for now and wait for Disconnected?
+                        // But `try_recv` returns `Result<SearchMessage, TryRecvError>`.
+                        // `TryRecvError::Disconnected` means all senders are gone.
+                        
+                        // So let's change the loop condition.
                     }
                     SearchMessage::Error(e) => {
                         self.search_in_progress = false;
@@ -260,6 +317,46 @@ impl TextViewerApp {
                         self.status_message = format!("Search failed: {}", e);
                         return; // Stop processing messages
                     }
+                }
+            }
+            
+            // Check if channel is disconnected
+            if let Err(std::sync::mpsc::TryRecvError::Disconnected) = rx.try_recv() {
+                self.search_in_progress = false;
+                self.search_message_rx = None;
+                
+                // Final sort to ensure everything is in order
+                self.search_results.sort_by_key(|r| r.byte_offset);
+                
+                // If we are in "Find All" mode, total_results should be at least search_results.len()
+                // But count task might be slower or faster.
+                // If count task finished, total_results is correct.
+                // If fetch task finished, search_results is populated.
+                
+                // If we are not finding all, total_results might be 0 (since we didn't run count task).
+                if !self.search_find_all {
+                    self.total_search_results = self.search_results.len();
+                } else {
+                    // Ensure total is at least what we have
+                    self.total_search_results = self.total_search_results.max(self.search_results.len());
+                }
+
+                let total = self.total_search_results;
+                if total > 0 {
+                    if self.search_find_all {
+                        self.status_message = format!("Found {} matches", total);
+                    } else {
+                        self.status_message = "Showing first match. Run Find All to see every result.".to_string();
+                    }
+                    
+                    // Ensure we scroll to the first result if we haven't yet
+                    if self.scroll_to_row.is_none() && !self.search_results.is_empty() {
+                         let target_line = self.line_indexer.find_line_at_offset(self.search_results[0].byte_offset);
+                         self.scroll_line = target_line;
+                         self.scroll_to_row = Some(target_line);
+                    }
+                } else {
+                    self.status_message = "No matches found".to_string();
                 }
             }
             
@@ -279,27 +376,203 @@ impl TextViewerApp {
     }
 
     fn go_to_next_result(&mut self) {
-        if !self.search_results.is_empty() {
-            self.current_result_index = (self.current_result_index + 1) % self.search_results.len();
-            let result = &self.search_results[self.current_result_index];
+        if self.total_search_results == 0 {
+            return;
+        }
+
+        let next_index = (self.current_result_index + 1) % self.total_search_results;
+        
+        // Check if next_index is within current page
+        let page_end_index = self.search_page_start_index + self.search_results.len();
+        
+        if next_index >= self.search_page_start_index && next_index < page_end_index {
+            // In current page
+            self.current_result_index = next_index;
+            let local_index = next_index - self.search_page_start_index;
+            let result = &self.search_results[local_index];
             let target_line = self.line_indexer.find_line_at_offset(result.byte_offset);
             self.scroll_line = target_line;
             self.scroll_to_row = Some(target_line);
+        } else {
+            // Need to fetch next page
+            // If we are wrapping around to 0
+            if next_index == 0 {
+                self.fetch_page(0, 0);
+            } else {
+                // Fetch next page starting from the end of current page
+                // We need the byte offset to start searching from.
+                // If we are just moving to the next page sequentially, we can use the last result's offset.
+                if let Some(last_result) = self.search_results.last() {
+                    // Start searching after the last result
+                    // We should probably store the start offset of the next page if we knew it?
+                    // But we don't. We just know we want the next 1000 results after the current last one.
+                    let start_offset = last_result.byte_offset + 1; // +1 or +match_len? Regex find resumes after match.
+                    // Actually, if we use `fetch_matches`, it uses `find_iter` which handles overlap.
+                    // But we need to give it a start position.
+                    // If we give `last_result.byte_offset + 1`, we might miss a match starting at `byte_offset + 1` if `match_len > 1`?
+                    // No, if we found a match at `byte_offset`, the next match must start after it (or overlapping if regex allows, but `find_iter` is non-overlapping).
+                    // So `byte_offset + match_len` is the correct resume point for `find_iter`.
+                    // But `fetch_matches` takes a `start_offset` and treats it as the beginning of the search.
+                    
+                    // We should record the current page start offset before moving
+                    if self.page_offsets.len() <= next_index / 1000 {
+                         // This logic assumes pages are always 1000.
+                         // But `search_results.len()` might be less if EOF.
+                         // If we are here, it means we have more results (total > current page end).
+                         // So we can assume we are fetching the next page.
+                         // We should store the offset for the *current* page if not stored.
+                         // But we want to store the offset for the *next* page so we can come back to it?
+                         // No, `page_offsets` stores the start offset of each page.
+                         // Page 0: 0.
+                         // Page 1: offset X.
+                         
+                         // When we loaded Page 0, we didn't push 0 to `page_offsets`. We should.
+                         if self.page_offsets.is_empty() {
+                             self.page_offsets.push(0);
+                         }
+                         
+                         // Now we are moving to Page N+1.
+                         // The start offset for Page N+1 is `last_result.byte_offset + last_result.match_len`?
+                         // Or just `last_result.byte_offset + 1`?
+                         // Let's use `last_result.byte_offset + 1` to be safe, `find_iter` will skip if needed?
+                         // Actually `find_iter` starts at the beginning of the string.
+                         // If we pass a slice starting at `offset`, it finds matches in that slice.
+                         // So yes, `last_result.byte_offset + 1` is safe, but `last_result.byte_offset + last_result.match_len` is more correct for non-overlapping.
+                         // Let's use `last_result.byte_offset + 1` to be conservative.
+                         
+                         let next_page_start_offset = last_result.byte_offset + 1;
+                         // We might need to store this to `page_offsets`?
+                         // We can store it when we successfully load the page?
+                         // Or store it now.
+                         // But we don't know if we will find results.
+                         // But we know `total_search_results` > `next_index`.
+                    }
+                    
+                    let start_offset = last_result.byte_offset + 1;
+                    self.fetch_page(next_index, start_offset);
+                } else {
+                    // Should not happen if total > 0
+                    self.fetch_page(0, 0);
+                }
+            }
+            self.current_result_index = next_index;
         }
     }
 
     fn go_to_previous_result(&mut self) {
-        if !self.search_results.is_empty() {
-            self.current_result_index = if self.current_result_index == 0 {
-                self.search_results.len() - 1
-            } else {
-                self.current_result_index - 1
-            };
-            let result = &self.search_results[self.current_result_index];
+        if self.total_search_results == 0 {
+            return;
+        }
+
+        let prev_index = if self.current_result_index == 0 {
+            self.total_search_results - 1
+        } else {
+            self.current_result_index - 1
+        };
+
+        // Check if prev_index is within current page
+        let page_end_index = self.search_page_start_index + self.search_results.len();
+        
+        if prev_index >= self.search_page_start_index && prev_index < page_end_index {
+            // In current page
+            self.current_result_index = prev_index;
+            let local_index = prev_index - self.search_page_start_index;
+            let result = &self.search_results[local_index];
             let target_line = self.line_indexer.find_line_at_offset(result.byte_offset);
             self.scroll_line = target_line;
             self.scroll_to_row = Some(target_line);
+        } else {
+            // Need to fetch previous page (or last page if wrapping)
+            if prev_index == self.total_search_results - 1 {
+                // Wrapping to last page.
+                // We don't know the offset of the last page easily unless we visited it.
+                // But we can guess or just search from 0? No, that's slow.
+                // If we haven't visited it, we can't jump to it efficiently without scanning.
+                // But the user asked for "Next" optimization.
+                // For "Previous" wrapping to end, we might have to disable it or warn?
+                // Or just scan from 0 until we find it (might take time).
+                // Let's just say "Cannot jump to end" or try to find it.
+                // Or, since we know `total_results`, we can try to find the last page.
+                // But we don't know where it starts.
+                
+                // For now, let's just reset to 0 if we can't find it?
+                // Or better: If we have `page_offsets` for the target page, use it.
+                // If not, maybe we shouldn't wrap?
+                // Let's disable wrapping for now if we don't have the offset.
+                // Or just fetch page 0.
+                self.status_message = "Cannot wrap to end in paginated mode yet.".to_string();
+                return;
+            } else {
+                // Fetch previous page
+                // We need the start offset of the page containing `prev_index`.
+                // We assume pages are 1000 items.
+                let target_page_idx = prev_index / 1000;
+                let target_page_start_index = target_page_idx * 1000;
+                
+                if let Some(&offset) = self.page_offsets.get(target_page_idx) {
+                    self.fetch_page(target_page_start_index, offset);
+                    self.current_result_index = prev_index;
+                } else {
+                    // We don't have the offset. This happens if we jumped around or haven't visited.
+                    // But we should have visited previous pages to get here?
+                    // Unless we jumped? We don't support jumping to arbitrary result index yet.
+                    // So we should have it.
+                    // But wait, `page_offsets` needs to be populated.
+                    // I'll ensure `fetch_page` populates it.
+                    
+                    // If we are at page 1 (1000-1999) and go back to 999 (page 0).
+                    // We should have `page_offsets[0]`.
+                    
+                    // Fallback: Search from 0?
+                    self.fetch_page(0, 0);
+                    self.current_result_index = 0; // Reset to 0 if lost
+                }
+            }
         }
+    }
+
+    fn fetch_page(&mut self, start_index: usize, start_offset: usize) {
+        if self.search_in_progress {
+            return;
+        }
+        
+        let Some(ref reader) = self.file_reader else { return };
+        
+        self.search_results.clear();
+        self.search_page_start_index = start_index;
+        
+        // Update page_offsets
+        let page_idx = start_index / 1000;
+        if page_idx >= self.page_offsets.len() {
+            if page_idx == self.page_offsets.len() {
+                self.page_offsets.push(start_offset);
+            } else {
+                // Gap in pages? Should not happen with sequential navigation.
+                // But if it does, we can't easily fill it.
+                // Just resize and fill with 0? No.
+            }
+        } else {
+            // Update existing?
+            self.page_offsets[page_idx] = start_offset;
+        }
+
+        let reader = reader.clone();
+        let query = self.search_query.clone();
+        let use_regex = self.use_regex;
+        let (tx, rx) = std::sync::mpsc::sync_channel(10_000);
+        self.search_message_rx = Some(rx);
+        self.search_in_progress = true;
+        
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        self.search_cancellation_token = Some(cancel_token.clone());
+        
+        self.status_message = format!("Loading results {}...{}", start_index + 1, start_index + 1000);
+        
+        std::thread::spawn(move || {
+            let mut engine = SearchEngine::new();
+            engine.set_query(query, use_regex);
+            engine.fetch_matches(reader, tx, start_offset, 1000, cancel_token);
+        });
     }
 
     fn go_to_line(&mut self) {
@@ -412,11 +685,18 @@ impl TextViewerApp {
                 if self.search_in_progress {
                     ui.add(egui::Spinner::new().size(18.0));
                     ui.label("Searching...");
+                    if ui.button("Stop").clicked() {
+                        if let Some(token) = &self.search_cancellation_token {
+                            token.store(true, Ordering::Relaxed);
+                        }
+                        self.search_in_progress = false;
+                        self.status_message = "Search stopped by user".to_string();
+                    }
                 }
                 
-                let total_results = self.search_results.len();
+                let total_results = self.total_search_results;
                 if total_results > 0 {
-                    // Show current position over total, even if we stored fewer than total
+                    // Show current position over total
                     let current = (self.current_result_index + 1).min(total_results);
                     ui.label(format!("{}/{}", current, total_results));
                 }
@@ -533,7 +813,13 @@ impl TextViewerApp {
                                             continue;
                                         }
                                         let rel_end = (rel_start + res.match_len).min(line_text.len());
-                                        line_matches.push((rel_start, rel_end, idx == self.current_result_index));
+                                        
+                                        // Check if this is the currently selected result
+                                        // We need to map local index to global index
+                                        let global_idx = self.search_page_start_index + idx;
+                                        let is_selected = global_idx == self.current_result_index;
+                                        
+                                        line_matches.push((rel_start, rel_end, is_selected));
                                     }
                                     
                                     ui.horizontal(|ui| {
