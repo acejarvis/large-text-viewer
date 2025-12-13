@@ -68,6 +68,9 @@ pub struct TextViewerApp {
     
     // Programmatic scroll control
     scroll_to_row: Option<usize>,
+    // Correction for f32 scroll precision issues in large files
+    scroll_correction: i64,
+    pending_scroll_target: Option<usize>,
 }
 
 impl Default for TextViewerApp {
@@ -112,6 +115,8 @@ impl Default for TextViewerApp {
             selected_encoding: encoding_rs::UTF_8,
             show_encoding_selector: false,
             scroll_to_row: None,
+            scroll_correction: 0,
+            pending_scroll_target: None,
         }
     }
 }
@@ -481,6 +486,7 @@ impl TextViewerApp {
             let target_line = self.line_indexer.find_line_at_offset(result.byte_offset);
             self.scroll_line = target_line;
             self.scroll_to_row = Some(target_line);
+            self.pending_scroll_target = Some(target_line);
         } else {
             // Need to fetch next page
             // If we are wrapping around to 0
@@ -569,6 +575,7 @@ impl TextViewerApp {
             let target_line = self.line_indexer.find_line_at_offset(result.byte_offset);
             self.scroll_line = target_line;
             self.scroll_to_row = Some(target_line);
+            self.pending_scroll_target = Some(target_line);
         } else {
             // Need to fetch previous page (or last page if wrapping)
             if prev_index == self.total_search_results - 1 {
@@ -670,6 +677,7 @@ impl TextViewerApp {
                 // Show a few lines of context above the target line for better orientation
                 self.scroll_line = target_line.saturating_sub(3);
                 self.scroll_to_row = Some(target_line);
+                self.pending_scroll_target = Some(target_line);
                 self.status_message = format!("Jumped to line {}", line_num);
             } else {
                 self.status_message = "Line number out of range".to_string();
@@ -908,94 +916,113 @@ impl TextViewerApp {
                         line_height,
                         self.line_indexer.total_lines(),
                         |ui, row_range| {
-                            // Capture the first visible row
+                            // Calculate scroll correction if we just jumped
+                            if let Some(target) = self.pending_scroll_target.take() {
+                                self.scroll_correction = target as i64 - row_range.start as i64;
+                            }
+
+                            // Apply correction to find the actual start line we want to render
+                            let corrected_start_line = (row_range.start as i64 + self.scroll_correction).max(0) as usize;
+                            
+                            // Capture the first visible row (corrected)
                             if first_visible_row.is_none() {
-                                first_visible_row = row_range.clone().next();
+                                first_visible_row = Some(corrected_start_line);
                             }
                             
-                            for line_num in row_range {
-                                // Use get_line_with_reader for sparse index support
-                                if let Some((start, end)) = self.line_indexer.get_line_with_reader(line_num, reader) {
-                                    let line_text = reader.get_chunk(start, end);
-                                    let line_text = line_text.trim_end_matches('\n').trim_end_matches('\r');
-
-                                    // Collect matches that fall within this line's byte span; this works even with sparse line indexing
-                                    let mut line_matches: Vec<(usize, usize, bool)> = Vec::new();
-                                    
-                                    // Use binary search to find the first potential match
-                                    // This assumes search_results is sorted by byte_offset
-                                    let start_idx = self.search_results.partition_point(|r| r.byte_offset < start);
-                                    
-                                    for (idx, res) in self.search_results.iter().enumerate().skip(start_idx) {
-                                        if res.byte_offset >= end {
-                                            break;
-                                        }
-
-                                        let rel_start = res.byte_offset.saturating_sub(start);
-                                        if rel_start >= line_text.len() {
-                                            continue;
-                                        }
-                                        let rel_end = (rel_start + res.match_len).min(line_text.len());
-                                        
-                                        // Check if this is the currently selected result
-                                        // We need to map local index to global index
-                                        let global_idx = self.search_page_start_index + idx;
-                                        let is_selected = global_idx == self.current_result_index;
-                                        
-                                        line_matches.push((rel_start, rel_end, is_selected));
+                            // For contiguous rendering, we find the start offset of the first line
+                            // and then read sequentially.
+                            let mut current_offset = if let Some((start, _)) = self.line_indexer.get_line_with_reader(corrected_start_line, reader) {
+                                start
+                            } else {
+                                return;
+                            };
+                            
+                            // We iterate over the count of rows requested, but starting from our corrected line
+                            let count = row_range.end - row_range.start;
+                            let render_range = corrected_start_line..(corrected_start_line + count);
+                            
+                            for line_num in render_range {
+                                // Read line starting at current_offset
+                                // We need to find the end of the line
+                                let chunk_size = 4096; // Read in chunks to find newline
+                                let mut line_end = current_offset;
+                                let mut found_newline = false;
+                                
+                                // Scan for newline
+                                while !found_newline {
+                                    let chunk = reader.get_bytes(line_end, line_end + chunk_size);
+                                    if chunk.is_empty() {
+                                        break;
                                     }
                                     
-                                    ui.horizontal(|ui| {
-                                        if self.show_line_numbers {
-                                            let ln_text = egui::RichText::new(format!("{:6} ", line_num + 1))
-                                                .monospace()
-                                                .color(egui::Color32::DARK_GRAY);
-                                            // Make line numbers non-selectable so drag-select only captures the content text
-                                            ui.add(egui::Label::new(ln_text).selectable(false));
-                                        }
-                                        
-                                        // Build label with highlighted search matches
-                                        let label = if !line_matches.is_empty() {
-                                            // Create a LayoutJob to highlight matches within the line using their byte offsets
-                                            let mut job = egui::text::LayoutJob::default();
-                                            let mut last_end = 0;
+                                    if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+                                        line_end += pos + 1; // Include newline
+                                        found_newline = true;
+                                    } else {
+                                        line_end += chunk.len();
+                                    }
+                                    
+                                    if line_end >= reader.len() {
+                                        break;
+                                    }
+                                }
+                                
+                                let start = current_offset;
+                                let end = line_end;
+                                current_offset = end; // Next line starts here
+                                
+                                if start >= reader.len() {
+                                    break;
+                                }
 
-                                            for (abs_start, abs_end, is_selected) in line_matches.iter() {
-                                                if *abs_start > last_end {
-                                                    job.append(
-                                                        &line_text[last_end..*abs_start],
-                                                        0.0,
-                                                        egui::TextFormat {
-                                                            font_id: egui::FontId::monospace(self.font_size),
-                                                            color: if self.dark_mode { egui::Color32::LIGHT_GRAY } else { egui::Color32::BLACK },
-                                                            ..Default::default()
-                                                        },
-                                                    );
-                                                }
+                                let line_text = reader.get_chunk(start, end);
+                                let line_text = line_text.trim_end_matches('\n').trim_end_matches('\r');
 
-                                                let match_end = (*abs_end).min(line_text.len());
+                                // Collect matches that fall within this line's byte span; this works even with sparse line indexing
+                                let mut line_matches: Vec<(usize, usize, bool)> = Vec::new();
+                                
+                                // Use binary search to find the first potential match
+                                // This assumes search_results is sorted by byte_offset
+                                let start_idx = self.search_results.partition_point(|r| r.byte_offset < start);
+                                
+                                for (idx, res) in self.search_results.iter().enumerate().skip(start_idx) {
+                                    if res.byte_offset >= end {
+                                        break;
+                                    }
+
+                                    let rel_start = res.byte_offset.saturating_sub(start);
+                                    if rel_start >= line_text.len() {
+                                        continue;
+                                    }
+                                    let rel_end = (rel_start + res.match_len).min(line_text.len());
+                                    
+                                    // Check if this is the currently selected result
+                                    // We need to map local index to global index
+                                    let global_idx = self.search_page_start_index + idx;
+                                    let is_selected = global_idx == self.current_result_index;
+                                    
+                                    line_matches.push((rel_start, rel_end, is_selected));
+                                }
+                                
+                                ui.horizontal(|ui| {
+                                    if self.show_line_numbers {
+                                        let ln_text = egui::RichText::new(format!("{:6} ", line_num + 1))
+                                            .monospace()
+                                            .color(egui::Color32::DARK_GRAY);
+                                        // Make line numbers non-selectable so drag-select only captures the content text
+                                        ui.add(egui::Label::new(ln_text).selectable(false));
+                                    }
+                                    
+                                    // Build label with highlighted search matches
+                                    let label = if !line_matches.is_empty() {
+                                        // Create a LayoutJob to highlight matches within the line using their byte offsets
+                                        let mut job = egui::text::LayoutJob::default();
+                                        let mut last_end = 0;
+
+                                        for (abs_start, abs_end, is_selected) in line_matches.iter() {
+                                            if *abs_start > last_end {
                                                 job.append(
-                                                    &line_text[*abs_start..match_end],
-                                                    0.0,
-                                                    egui::TextFormat {
-                                                        font_id: egui::FontId::monospace(self.font_size),
-                                                        color: egui::Color32::BLACK,
-                                                        background: if *is_selected {
-                                                            egui::Color32::from_rgb(255, 200, 0) // orange-ish for current match
-                                                        } else {
-                                                            egui::Color32::YELLOW
-                                                        },
-                                                        ..Default::default()
-                                                    },
-                                                );
-
-                                                last_end = match_end;
-                                            }
-
-                                            // Add remaining text after last match
-                                            if last_end < line_text.len() {
-                                                job.append(
-                                                    &line_text[last_end..],
+                                                    &line_text[last_end..*abs_start],
                                                     0.0,
                                                     egui::TextFormat {
                                                         font_id: egui::FontId::monospace(self.font_size),
@@ -1005,36 +1032,67 @@ impl TextViewerApp {
                                                 );
                                             }
 
-                                            if self.wrap_mode {
-                                                job.wrap = egui::text::TextWrapping {
-                                                    max_width: ui.available_width(),
+                                            let match_end = (*abs_end).min(line_text.len());
+                                            job.append(
+                                                &line_text[*abs_start..match_end],
+                                                0.0,
+                                                egui::TextFormat {
+                                                    font_id: egui::FontId::monospace(self.font_size),
+                                                    color: egui::Color32::BLACK,
+                                                    background: if *is_selected {
+                                                        egui::Color32::from_rgb(255, 200, 0) // orange-ish for current match
+                                                    } else {
+                                                        egui::Color32::YELLOW
+                                                    },
                                                     ..Default::default()
-                                                };
-                                            }
+                                                },
+                                            );
 
-                                            ui.add(egui::Label::new(job).extend())
-                                        } else {
-                                            let text = egui::RichText::new(line_text)
-                                                .monospace()
-                                                .size(self.font_size);
-                                            
-                                            // Apply wrap mode
-                                            if self.wrap_mode {
-                                                ui.add(egui::Label::new(text).wrap())
-                                            } else {
-                                                ui.add(egui::Label::new(text).extend())
-                                            }
-                                        };
-                                        
-                                        // Enable text selection for copy-paste
-                                        if label.hovered() {
-                                            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Text);
+                                            last_end = match_end;
                                         }
+
+                                        // Add remaining text after last match
+                                        if last_end < line_text.len() {
+                                            job.append(
+                                                &line_text[last_end..],
+                                                0.0,
+                                                egui::TextFormat {
+                                                    font_id: egui::FontId::monospace(self.font_size),
+                                                    color: if self.dark_mode { egui::Color32::LIGHT_GRAY } else { egui::Color32::BLACK },
+                                                    ..Default::default()
+                                                },
+                                            );
+                                        }
+
+                                        if self.wrap_mode {
+                                            job.wrap = egui::text::TextWrapping {
+                                                max_width: ui.available_width(),
+                                                ..Default::default()
+                                            };
+                                        }
+
+                                        ui.add(egui::Label::new(job).extend())
+                                    } else {
+                                        let text = egui::RichText::new(line_text)
+                                            .monospace()
+                                            .size(self.font_size);
                                         
-                                        // Ensure labels don't consume scroll events
-                                        label.surrender_focus();
-                                    });
-                                }
+                                        // Apply wrap mode
+                                        if self.wrap_mode {
+                                            ui.add(egui::Label::new(text).wrap())
+                                        } else {
+                                            ui.add(egui::Label::new(text).extend())
+                                        }
+                                    };
+                                    
+                                    // Enable text selection for copy-paste
+                                    if label.hovered() {
+                                        ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Text);
+                                    }
+                                    
+                                    // Ensure labels don't consume scroll events
+                                    label.surrender_focus();
+                                });
                             }
                         },
                     );
