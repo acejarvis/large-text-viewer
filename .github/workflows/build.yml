@@ -1,4 +1,4 @@
-name: Build Windows
+name: Build All Platforms
 
 on:
   pull_request:
@@ -6,8 +6,21 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: large-text-viewer
+            asset_name: large-text-viewer-linux
+          - os: windows-latest
+            artifact_name: large-text-viewer.exe
+            asset_name: large-text-viewer-windows
+          - os: macos-latest
+            artifact_name: large-text-viewer
+            asset_name: large-text-viewer-macos
     permissions:
       contents: read
     
@@ -49,11 +62,11 @@ jobs:
     - name: Run tests
       run: cargo test --release --verbose
     
-    - name: Upload Windows binary
+    - name: Upload binary
       uses: actions/upload-artifact@v4
       with:
-        name: large-text-viewer-windows
-        path: target/release/large-text-viewer.exe
+        name: ${{ matrix.asset_name }}
+        path: target/release/${{ matrix.artifact_name }}
         if-no-files-found: error
         retention-days: 5
 
