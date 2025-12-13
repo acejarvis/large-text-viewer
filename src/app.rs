@@ -7,7 +7,8 @@ use encoding_rs::Encoding;
 
 use crate::file_reader::{FileReader, detect_encoding, available_encodings};
 use crate::line_indexer::LineIndexer;
-use crate::search_engine::{SearchEngine, SearchResult, SearchMessage};
+use crate::search_engine::{SearchEngine, SearchResult, SearchMessage, SearchType};
+use crate::replacer::{Replacer, ReplaceMessage};
 
 pub struct TextViewerApp {
     file_reader: Option<Arc<FileReader>>,
@@ -24,6 +25,8 @@ pub struct TextViewerApp {
     
     // Search UI
     search_query: String,
+    replace_query: String,
+    show_replace: bool,
     use_regex: bool,
     search_results: Vec<SearchResult>,
     current_result_index: usize, // Global index (0 to total_results - 1)
@@ -35,6 +38,15 @@ pub struct TextViewerApp {
     search_find_all: bool,
     search_message_rx: Option<Receiver<SearchMessage>>,
     search_cancellation_token: Option<Arc<AtomicBool>>,
+    search_count_done: bool,
+    search_fetch_done: bool,
+    
+    // Replace UI
+    replace_in_progress: bool,
+    replace_message_rx: Option<Receiver<ReplaceMessage>>,
+    replace_cancellation_token: Option<Arc<AtomicBool>>,
+    replace_progress: Option<f32>,
+    replace_status_message: Option<String>,
     
     // Go to line
     goto_line_input: String,
@@ -71,6 +83,8 @@ impl Default for TextViewerApp {
             dark_mode: true,
             show_line_numbers: true,
             search_query: String::new(),
+            replace_query: String::new(),
+            show_replace: false,
             use_regex: false,
             search_results: Vec::new(),
             current_result_index: 0,
@@ -82,6 +96,13 @@ impl Default for TextViewerApp {
             search_find_all: true,
             search_message_rx: None,
             search_cancellation_token: None,
+            search_count_done: false,
+            search_fetch_done: false,
+            replace_in_progress: false,
+            replace_message_rx: None,
+            replace_cancellation_token: None,
+            replace_progress: None,
+            replace_status_message: None,
             goto_line_input: String::new(),
             show_file_info: false,
             tail_mode: false,
@@ -199,6 +220,8 @@ impl TextViewerApp {
         self.search_message_rx = Some(rx);
         self.search_in_progress = true;
         self.search_find_all = find_all;
+        self.search_count_done = false;
+        self.search_fetch_done = false;
         
         let cancel_token = Arc::new(AtomicBool::new(false));
         self.search_cancellation_token = Some(cancel_token.clone());
@@ -285,30 +308,19 @@ impl TextViewerApp {
                              // For now, let's defer the sort to outside the loop.
                         }
                     }
-                    SearchMessage::Done => {
-                        // We might receive multiple Done messages (one from count, one from fetch)
-                        // We should only stop when both are done?
-                        // Actually, we don't know how many tasks are running easily.
-                        // But `count_matches` sends Done. `fetch_matches` sends Done.
-                        // If we stop on first Done, we might kill the other.
-                        // But `search_in_progress` controls the spinner.
-                        // And `search_message_rx` controls receiving.
+                    SearchMessage::Done(search_type) => {
+                        match search_type {
+                            SearchType::Count => self.search_count_done = true,
+                            SearchType::Fetch => self.search_fetch_done = true,
+                        }
                         
-                        // If we are finding all, we expect 2 Done messages?
-                        // Or we can just ignore Done and rely on timeout? No.
-                        // Let's just keep running until channel disconnects?
-                        // `rx.try_recv()` returns Err(Empty) or Err(Disconnected).
-                        // If senders drop tx, we get Disconnected.
-                        // But we hold `tx` in `perform_search`? No, we dropped it there.
-                        // So when all threads finish, we get Disconnected.
-                        
-                        // So we should handle Disconnected instead of Done?
-                        // But `SearchMessage::Done` is explicit.
-                        // Let's just ignore Done for now and wait for Disconnected?
-                        // But `try_recv` returns `Result<SearchMessage, TryRecvError>`.
-                        // `TryRecvError::Disconnected` means all senders are gone.
-                        
-                        // So let's change the loop condition.
+                        if self.search_find_all && self.search_count_done {
+                             if self.search_results.len() == self.total_search_results {
+                                 if let Some(token) = &self.search_cancellation_token {
+                                     token.store(true, Ordering::Relaxed);
+                                 }
+                             }
+                        }
                     }
                     SearchMessage::Error(e) => {
                         self.search_in_progress = false;
@@ -372,6 +384,82 @@ impl TextViewerApp {
                      self.scroll_to_row = Some(target_line);
                 }
             }
+        }
+    }
+
+    fn poll_replace_results(&mut self) {
+        if !self.replace_in_progress {
+            return;
+        }
+
+        let mut done = false;
+        if let Some(ref rx) = self.replace_message_rx {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    ReplaceMessage::Progress(processed, total) => {
+                        let progress = processed as f32 / total as f32;
+                        self.replace_progress = Some(progress);
+                        self.replace_status_message = Some(format!("Replacing... {:.1}%", progress * 100.0));
+                    }
+                    ReplaceMessage::Done => {
+                        self.replace_status_message = Some("Replacement complete.".to_string());
+                        self.status_message = "Replacement complete.".to_string();
+                        done = true;
+                    }
+                    ReplaceMessage::Error(e) => {
+                        self.replace_status_message = Some(format!("Replace failed: {}", e));
+                        self.status_message = format!("Replace failed: {}", e);
+                        done = true;
+                    }
+                }
+            }
+        }
+
+        if done {
+            self.replace_in_progress = false;
+            self.replace_message_rx = None;
+            self.replace_cancellation_token = None;
+            self.replace_progress = None;
+        }
+    }
+
+    fn perform_replace(&mut self) {
+        if self.replace_in_progress {
+            return;
+        }
+        
+        let Some(ref reader) = self.file_reader else { return };
+        let input_path = reader.path().clone();
+        
+        // Ask for output file
+        if let Some(output_path) = rfd::FileDialog::new()
+            .set_file_name(&format!("{}.modified", input_path.file_name().unwrap().to_string_lossy()))
+            .save_file() 
+        {
+            let query = self.search_query.clone();
+            let replace_with = self.replace_query.clone();
+            let use_regex = self.use_regex;
+            
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.replace_message_rx = Some(rx);
+            self.replace_in_progress = true;
+            self.replace_progress = Some(0.0);
+            self.replace_status_message = None;
+            
+            let cancel_token = Arc::new(AtomicBool::new(false));
+            self.replace_cancellation_token = Some(cancel_token.clone());
+            
+            std::thread::spawn(move || {
+                Replacer::replace_all(
+                    &input_path,
+                    &output_path,
+                    &query,
+                    &replace_with,
+                    use_regex,
+                    tx,
+                    cancel_token,
+                );
+            });
         }
     }
 
@@ -637,6 +725,9 @@ impl TextViewerApp {
 
                 ui.menu_button("Search", |ui| {
                     ui.checkbox(&mut self.use_regex, "Use Regex");
+                    if ui.checkbox(&mut self.show_replace, "Show Replace").changed() {
+                        // Reset replace state if hidden? No, keep it.
+                    }
                 });
 
                 ui.menu_button("Tools", |ui| {
@@ -717,6 +808,38 @@ impl TextViewerApp {
                     self.go_to_line();
                 }
             });
+
+            if self.show_replace {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Replace with:");
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.replace_query)
+                            .desired_width(200.0)
+                            .hint_text("Replacement text...")
+                    );
+
+                    if self.replace_in_progress {
+                        if ui.button("Stop Replace").clicked() {
+                            if let Some(token) = &self.replace_cancellation_token {
+                                token.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        ui.spinner();
+                        if let Some(progress) = self.replace_progress {
+                            ui.label(format!("{:.1}%", progress * 100.0));
+                        }
+                    } else {
+                        if ui.button("Replace All").clicked() {
+                            self.perform_replace();
+                        }
+                    }
+                });
+                
+                if let Some(ref msg) = self.replace_status_message {
+                    ui.label(msg);
+                }
+            }
             
             if let Some(ref error) = self.search_error {
                 ui.colored_label(egui::Color32::RED, format!("Search error: {}", error));
@@ -999,8 +1122,9 @@ impl eframe::App for TextViewerApp {
         }
 
         self.poll_search_results();
+        self.poll_replace_results();
 
-        if self.search_in_progress {
+        if self.search_in_progress || self.replace_in_progress {
             ctx.request_repaint(); // Keep spinner animated during long searches
         }
 
