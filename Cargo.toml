@@ -2,6 +2,11 @@
 name = "large-text-viewer"
 version = "0.1.0"
 edition = "2021"
+description = "A high-performance viewer for large text files"
+license = "MIT"
+repository = "https://github.com/acejarvis/large-text-viewer"
+keywords = ["gui", "text-viewer", "large-file"]
+categories = ["gui", "visualization"]
 
 [workspace]
 members = ["crates/large-text-core"]
@@ -13,4 +18,4 @@ notify = "6.1"
 rfd = "0.15"
 anyhow = "1.0"
 encoding_rs = "0.8"
-large-text-core = { path = "crates/large-text-core" }
+large-text-core = { path = "crates/large-text-core", version = "0.1.0" }

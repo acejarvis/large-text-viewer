@@ -2,6 +2,11 @@
 name = "large-text-core"
 version = "0.1.0"
 edition = "2021"
+description = "Core library for handling large text files search and replace efficiently"
+license = "MIT"
+repository = "https://github.com/acejarvis/large-text-viewer"
+keywords = ["text", "viewer", "large-file", "log-viewer"]
+categories = ["text-processing"]
 
 [dependencies]
 anyhow = "1.0"
