@@ -52,21 +52,21 @@ impl Replacer {
             let pattern = format!("(?i){}", regex::escape(query));
             Regex::new(&pattern)?
         };
-        
+
         let replace_with_bytes = replace_with.as_bytes();
 
         // Buffer size: 1MB
         const BUFFER_SIZE: usize = 1024 * 1024;
-        // Overlap: enough to cover max match length. 
-        const OVERLAP_SIZE: usize = 4096; 
+        // Overlap: enough to cover max match length.
+        const OVERLAP_SIZE: usize = 4096;
 
         let mut buffer = vec![0u8; BUFFER_SIZE + OVERLAP_SIZE];
-        let mut buffer_len = 0;
         let mut eof = false;
 
         // Initial fill
         let n = input_file.read(&mut buffer[0..BUFFER_SIZE])?;
-        buffer_len = n;
+        let mut buffer_len = n;
+
         if n < BUFFER_SIZE {
             eof = true;
         }
@@ -85,11 +85,11 @@ impl Replacer {
                 valid_len -= 1;
             }
             if valid_len == 0 && buffer_len > 0 {
-                valid_len = buffer_len; 
+                valid_len = buffer_len;
             }
 
             let chunk_bytes = &buffer[..valid_len];
-            
+
             let safe_zone_end = if eof {
                 valid_len
             } else {
@@ -97,7 +97,7 @@ impl Replacer {
             };
 
             let mut last_match_end = 0;
-            
+
             for cap in regex.captures_iter(chunk_bytes) {
                 let mat = cap.get(0).unwrap();
                 if mat.start() >= safe_zone_end {
@@ -118,7 +118,7 @@ impl Replacer {
             // If last_match_end > safe_zone_end, it means we processed a match that crossed the boundary.
             // In that case, we have already written the replacement, so we should NOT write the original text.
             // And we should shift the buffer starting from last_match_end.
-            
+
             let shift_start = if last_match_end > safe_zone_end {
                 last_match_end
             } else {
@@ -126,14 +126,14 @@ impl Replacer {
                 output_file.write_all(&chunk_bytes[last_match_end..safe_zone_end])?;
                 safe_zone_end
             };
-            
+
             // Shift remaining bytes to start
             let remaining_bytes = &buffer[shift_start..buffer_len];
             let remaining_len = remaining_bytes.len();
-            
+
             let remaining_vec = remaining_bytes.to_vec();
             buffer[0..remaining_len].copy_from_slice(&remaining_vec);
-            
+
             // Fill the rest of the buffer
             if !eof {
                 let bytes_to_read = BUFFER_SIZE - remaining_len;
@@ -146,23 +146,9 @@ impl Replacer {
                 buffer_len = remaining_len; // We keep the remaining bytes if EOF (should be 0 if we processed everything)
                 if remaining_len == 0 {
                     buffer_len = 0;
-                } else {
-                    // If we are at EOF and have remaining bytes, it means we couldn't process them?
-                    // Or we just shifted them.
-                    // If we are at EOF, safe_zone_end == valid_len.
-                    // So shift_start == valid_len (or last_match_end).
-                    // If last_match_end == valid_len, remaining_len == 0.
-                    // If last_match_end < valid_len, we wrote up to valid_len. remaining_len == 0.
-                    // So remaining_len should be 0 at EOF.
-                    // Unless valid_len < buffer_len (partial char at EOF).
-                    // Then remaining_len > 0.
-                    // We loop again. valid_len will be 0 (if still partial).
-                    // Then valid_len becomes buffer_len.
-                    // We process.
-                    // Then remaining_len becomes 0.
                 }
             }
-            
+
             processed_offset += shift_start;
             let _ = tx.send(ReplaceMessage::Progress(processed_offset, file_len));
         }
