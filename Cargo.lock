@@ -1785,6 +1785,7 @@ dependencies = [
  "notify",
  "regex",
  "rfd",
+ "tempfile",
 ]
 
 [[package]]

@@ -210,3 +210,41 @@ impl LineIndexer {
         self.total_lines
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    use crate::file_reader::detect_encoding;
+
+    #[test]
+    fn test_line_indexer_small_file() -> anyhow::Result<()> {
+        let mut file = NamedTempFile::new()?;
+        write!(file, "Line 1\nLine 2\nLine 3")?;
+        let path = file.path().to_path_buf();
+        
+        let reader = FileReader::new(path, detect_encoding(b""))?;
+        let mut indexer = LineIndexer::new();
+        indexer.index_file(&reader);
+
+        assert_eq!(indexer.total_lines, 3);
+        assert_eq!(indexer.line_offsets, vec![0, 7, 14]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_line_indexer_empty_lines() -> anyhow::Result<()> {
+        let mut file = NamedTempFile::new()?;
+        write!(file, "\n\n\n")?;
+        let path = file.path().to_path_buf();
+        
+        let reader = FileReader::new(path, detect_encoding(b""))?;
+        let mut indexer = LineIndexer::new();
+        indexer.index_file(&reader);
+
+        assert_eq!(indexer.total_lines, 4);
+        assert_eq!(indexer.line_offsets, vec![0, 1, 2, 3]);
+        Ok(())
+    }
+}

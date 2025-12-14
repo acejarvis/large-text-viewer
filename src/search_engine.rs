@@ -294,3 +294,66 @@ impl SearchEngine {
         self.total_results = 0;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    use crate::file_reader::detect_encoding;
+    use std::sync::mpsc;
+
+    #[test]
+    fn test_find_in_text() {
+        let mut engine = SearchEngine::new();
+        engine.set_query("test".to_string(), false, false);
+
+        let text = "This is a test string. Another test.";
+        let matches = engine.find_in_text(text);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0], (10, 14));
+        assert_eq!(matches[1], (31, 35));
+    }
+
+    #[test]
+    fn test_find_in_text_regex() {
+        let mut engine = SearchEngine::new();
+        engine.set_query(r"\d+".to_string(), true, false);
+
+        let text = "There are 123 apples and 456 oranges.";
+        let matches = engine.find_in_text(text);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0], (10, 13)); // "123"
+        assert_eq!(matches[1], (25, 28)); // "456"
+    }
+
+    #[test]
+    fn test_count_matches() -> anyhow::Result<()> {
+        let mut file = NamedTempFile::new()?;
+        write!(file, "test\ntest\ntest")?;
+        let path = file.path().to_path_buf();
+
+        let reader = Arc::new(FileReader::new(path, detect_encoding(b""))?);
+        let mut engine = SearchEngine::new();
+        engine.set_query("test".to_string(), false, false);
+
+        let (tx, rx) = mpsc::sync_channel(10);
+        let cancel_token = Arc::new(AtomicBool::new(false));
+
+        engine.count_matches(reader, tx, cancel_token);
+
+        let mut count = 0;
+        loop {
+            match rx.recv() {
+                Ok(SearchMessage::CountResult(c)) => count += c,
+                Ok(SearchMessage::Done(SearchType::Count)) => break,
+                Ok(SearchMessage::Error(e)) => panic!("Error: {}", e),
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+
+        assert_eq!(count, 3);
+        Ok(())
+    }
+}
