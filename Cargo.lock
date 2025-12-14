@@ -1774,6 +1774,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "large-text-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "encoding_rs",
+ "memmap2",
+ "regex",
+ "tempfile",
+]
+
+[[package]]
 name = "large-text-viewer"
 version = "0.1.0"
 dependencies = [
@@ -1781,11 +1792,9 @@ dependencies = [
  "eframe",
  "egui",
  "encoding_rs",
- "memmap2",
+ "large-text-core",
  "notify",
- "regex",
  "rfd",
- "tempfile",
 ]
 
 [[package]]

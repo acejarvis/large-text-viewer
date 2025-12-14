@@ -1,8 +1,4 @@
 mod app;
-mod file_reader;
-mod line_indexer;
-mod replacer;
-mod search_engine;
 
 use app::TextViewerApp;
 use eframe::egui;

@@ -8,10 +8,10 @@ use std::sync::{
     Arc,
 };
 
-use crate::file_reader::{available_encodings, detect_encoding, FileReader};
-use crate::line_indexer::LineIndexer;
-use crate::replacer::{ReplaceMessage, Replacer};
-use crate::search_engine::{SearchEngine, SearchMessage, SearchResult, SearchType};
+use large_text_core::file_reader::{available_encodings, detect_encoding, FileReader};
+use large_text_core::line_indexer::LineIndexer;
+use large_text_core::replacer::{ReplaceMessage, Replacer};
+use large_text_core::search_engine::{SearchEngine, SearchMessage, SearchResult, SearchType};
 
 pub struct TextViewerApp {
     file_reader: Option<Arc<FileReader>>,

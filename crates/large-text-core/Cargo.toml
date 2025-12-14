@@ -1,0 +1,13 @@
+[package]
+name = "large-text-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+encoding_rs = "0.8"
+memmap2 = "0.9"
+regex = "1.10"
+
+[dev-dependencies]
+tempfile = "3.23.0"
