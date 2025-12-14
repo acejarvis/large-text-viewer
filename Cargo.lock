@@ -1794,6 +1794,7 @@ dependencies = [
  "large-text-core",
  "notify",
  "rfd",
+ "tempfile",
 ]
 
 [[package]]
