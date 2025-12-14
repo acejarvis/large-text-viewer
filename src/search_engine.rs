@@ -1,6 +1,10 @@
-use regex::Regex;
 use crate::file_reader::FileReader;
-use std::sync::{Arc, mpsc::SyncSender, atomic::{AtomicBool, Ordering}};
+use regex::Regex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc::SyncSender,
+    Arc,
+};
 use std::thread;
 
 pub struct SearchEngine {
@@ -15,6 +19,7 @@ pub struct SearchEngine {
 #[derive(Clone, Debug)]
 pub struct SearchResult {
     pub byte_offset: usize,
+    pub match_len: usize,
 }
 
 pub struct ChunkSearchResult {
@@ -165,7 +170,7 @@ impl SearchEngine {
                         }
                         let _ = tx_clone.send(SearchMessage::CountResult(local_count));
                     } else {
-                         let _ = tx_clone.send(SearchMessage::Error("Invalid regex".to_string()));
+                        let _ = tx_clone.send(SearchMessage::Error("Invalid regex".to_string()));
                     }
                 });
                 handles.push(handle);
@@ -250,15 +255,18 @@ impl SearchEngine {
 
                         local_matches.push(SearchResult {
                             byte_offset: absolute_start,
+                            match_len: mat.end() - mat.start(),
                         });
                         results_found += 1;
                     }
 
                     if !local_matches.is_empty() {
-
-                        if tx.send(SearchMessage::ChunkResult(ChunkSearchResult {
-                            matches: local_matches,
-                        })).is_err() {
+                        if tx
+                            .send(SearchMessage::ChunkResult(ChunkSearchResult {
+                                matches: local_matches,
+                            }))
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -274,7 +282,7 @@ impl SearchEngine {
                     let _ = tx.send(SearchMessage::Done(SearchType::Fetch));
                 }
             } else {
-                 let _ = tx.send(SearchMessage::Error("Invalid regex".to_string()));
+                let _ = tx.send(SearchMessage::Error("Invalid regex".to_string()));
             }
         });
     }
