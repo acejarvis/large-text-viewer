@@ -1,8 +1,8 @@
+use anyhow::Result;
+use encoding_rs::{Encoding, UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252};
 use memmap2::Mmap;
 use std::fs::File;
 use std::path::PathBuf;
-use anyhow::Result;
-use encoding_rs::{Encoding, UTF_8, UTF_16LE, UTF_16BE, WINDOWS_1252};
 
 pub struct FileReader {
     mmap: Mmap,
@@ -18,7 +18,7 @@ impl FileReader {
             anyhow::bail!("Cannot memory-map an empty file: {:?}", path);
         }
         let mmap = unsafe { Mmap::map(&file)? };
-        
+
         Ok(Self {
             mmap,
             path,

@@ -1,9 +1,13 @@
-use std::fs::File;
-use std::io::{Write, BufWriter, Read};
-use std::path::Path;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc::Sender};
-use regex::bytes::Regex;
 use anyhow::Result;
+use regex::bytes::Regex;
+use std::fs::File;
+use std::io::{BufWriter, Read, Write};
+use std::path::Path;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc::Sender,
+    Arc,
+};
 
 pub enum ReplaceMessage {
     Progress(usize, usize), // bytes_processed, total_bytes
@@ -23,7 +27,15 @@ impl Replacer {
         tx: Sender<ReplaceMessage>,
         cancel_token: Arc<AtomicBool>,
     ) {
-        match Self::replace_all_inner(input_path, output_path, query, replace_with, use_regex, &tx, cancel_token) {
+        match Self::replace_all_inner(
+            input_path,
+            output_path,
+            query,
+            replace_with,
+            use_regex,
+            &tx,
+            cancel_token,
+        ) {
             Ok(_) => {
                 let _ = tx.send(ReplaceMessage::Done);
             }
@@ -136,7 +148,8 @@ impl Replacer {
             // Fill the rest of the buffer
             if !eof {
                 let bytes_to_read = BUFFER_SIZE - remaining_len;
-                let n = input_file.read(&mut buffer[remaining_len..remaining_len + bytes_to_read])?;
+                let n =
+                    input_file.read(&mut buffer[remaining_len..remaining_len + bytes_to_read])?;
                 buffer_len = remaining_len + n;
                 if n == 0 {
                     eof = true;

@@ -1,11 +1,11 @@
+mod app;
 mod file_reader;
 mod line_indexer;
-mod search_engine;
 mod replacer;
-mod app;
+mod search_engine;
 
-use eframe::egui;
 use app::TextViewerApp;
+use eframe::egui;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {

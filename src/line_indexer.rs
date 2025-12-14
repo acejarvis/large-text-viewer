@@ -104,7 +104,6 @@ impl LineIndexer {
         }
     }
 
-
     pub fn get_line_range(&self, line_num: usize) -> Option<(usize, usize)> {
         if self.sample_interval == 0 {
             // Full index available
@@ -129,7 +128,11 @@ impl LineIndexer {
     }
 
     // Helper method to get actual line content by scanning from estimated position
-    pub fn get_line_with_reader(&self, line_num: usize, reader: &FileReader) -> Option<(usize, usize)> {
+    pub fn get_line_with_reader(
+        &self,
+        line_num: usize,
+        reader: &FileReader,
+    ) -> Option<(usize, usize)> {
         if self.sample_interval == 0 {
             // Use full index
             return self.get_line_range(line_num);
@@ -141,7 +144,9 @@ impl LineIndexer {
         // Scan backwards to find start of line (in case we landed mid-line)
         // Increase scan radius to handle variance in line lengths and very long lines
         let scan_radius = (self.avg_line_length * 2.0).max(65536.0) as usize;
-        let scan_start = estimated_byte_pos.saturating_sub(scan_radius).min(self.file_size);
+        let scan_start = estimated_byte_pos
+            .saturating_sub(scan_radius)
+            .min(self.file_size);
         let scan_end = (estimated_byte_pos + scan_radius).min(self.file_size);
 
         if scan_start >= scan_end {
@@ -204,6 +209,4 @@ impl LineIndexer {
     pub fn total_lines(&self) -> usize {
         self.total_lines
     }
-
-
 }

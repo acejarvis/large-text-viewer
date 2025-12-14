@@ -19,6 +19,7 @@ pub struct SearchEngine {
 #[derive(Clone, Debug)]
 pub struct SearchResult {
     pub byte_offset: usize,
+    pub match_len: usize,
 }
 
 pub struct ChunkSearchResult {
@@ -254,6 +255,7 @@ impl SearchEngine {
 
                         local_matches.push(SearchResult {
                             byte_offset: absolute_start,
+                            match_len: mat.end() - mat.start(),
                         });
                         results_found += 1;
                     }
