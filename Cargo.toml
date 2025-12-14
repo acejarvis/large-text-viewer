@@ -3,12 +3,14 @@ name = "large-text-viewer"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+members = ["crates/large-text-core"]
+
 [dependencies]
 eframe = "0.29"
 egui = "0.29"
-memmap2 = "0.9"
-encoding_rs = "0.8"
 notify = "6.1"
-regex = "1.10"
 rfd = "0.15"
 anyhow = "1.0"
+encoding_rs = "0.8"
+large-text-core = { path = "crates/large-text-core" }
