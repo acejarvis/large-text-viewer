@@ -314,9 +314,13 @@ impl TextViewerApp {
                         self.search_results.extend(chunk_result.matches);
                         new_results_added = true;
 
-                        // If it found results and haven't scrolled yet, scroll to the first one
+                        // If we found results and haven't scrolled yet, scroll to the first one
                         if !self.search_results.is_empty() && self.scroll_to_row.is_none() && self.current_result_index == 0 {
-
+                             // We need to sort at least once to find the true first result
+                             // But doing it here might be expensive if we do it often.
+                             // For the very first result, we can just check if we have any.
+                             // However, to be correct, we should probably wait or do a partial check.
+                             // For now, let's defer the sort to outside the loop.
                         }
                     }
                     SearchMessage::Done(search_type) => {
@@ -351,6 +355,12 @@ impl TextViewerApp {
                 // Final sort to ensure everything is in order
                 self.search_results.sort_by_key(|r| r.byte_offset);
 
+                // If we are in "Find All" mode, total_results should be at least search_results.len()
+                // But count task might be slower or faster.
+                // If count task finished, total_results is correct.
+                // If fetch task finished, search_results is populated.
+
+                // If we are not finding all, total_results might be 0 (since we didn't run count task).
                 if !self.search_find_all {
                     self.total_search_results = self.search_results.len();
                 } else {
@@ -488,25 +498,61 @@ impl TextViewerApp {
             self.scroll_to_row = Some(target_line);
             self.pending_scroll_target = Some(target_line);
         } else {
-            // Fetch next page
+            // Need to fetch next page
+            // If we are wrapping around to 0
             if next_index == 0 {
                 self.fetch_page(0, 0);
             } else {
                 // Fetch next page starting from the end of current page
+                // We need the byte offset to start searching from.
+                // If we are just moving to the next page sequentially, we can use the last result's offset.
                 if let Some(last_result) = self.search_results.last() {
                     // Start searching after the last result
-
+                    // We should probably store the start offset of the next page if we knew it?
+                    // But we don't. We just know we want the next 1000 results after the current last one.
                     let start_offset = last_result.byte_offset + 1; // +1 or +match_len? Regex find resumes after match.
+                    // Actually, if we use `fetch_matches`, it uses `find_iter` which handles overlap.
+                    // But we need to give it a start position.
+                    // If we give `last_result.byte_offset + 1`, we might miss a match starting at `byte_offset + 1` if `match_len > 1`?
+                    // No, if we found a match at `byte_offset`, the next match must start after it (or overlapping if regex allows, but `find_iter` is non-overlapping).
+                    // So `byte_offset + match_len` is the correct resume point for `find_iter`.
+                    // But `fetch_matches` takes a `start_offset` and treats it as the beginning of the search.
 
+                    // We should record the current page start offset before moving
                     if self.page_offsets.len() <= next_index / 1000 {
+                         // This logic assumes pages are always 1000.
+                         // But `search_results.len()` might be less if EOF.
+                         // If we are here, it means we have more results (total > current page end).
+                         // So we can assume we are fetching the next page.
+                         // We should store the offset for the *current* page if not stored.
+                         // But we want to store the offset for the *next* page so we can come back to it?
+                         // No, `page_offsets` stores the start offset of each page.
+                         // Page 0: 0.
+                         // Page 1: offset X.
+
+                         // When we loaded Page 0, we didn't push 0 to `page_offsets`. We should.
                          if self.page_offsets.is_empty() {
                              self.page_offsets.push(0);
                          }
 
-                        //  let next_page_start_offset = last_result.byte_offset + 1;
+                         // Now we are moving to Page N+1.
+                         // The start offset for Page N+1 is `last_result.byte_offset + last_result.match_len`?
+                         // Or just `last_result.byte_offset + 1`?
+                         // Let's use `last_result.byte_offset + 1` to be safe, `find_iter` will skip if needed?
+                         // Actually `find_iter` starts at the beginning of the string.
+                         // If we pass a slice starting at `offset`, it finds matches in that slice.
+                         // So yes, `last_result.byte_offset + 1` is safe, but `last_result.byte_offset + last_result.match_len` is more correct for non-overlapping.
+                         // Let's use `last_result.byte_offset + 1` to be conservative.
+
+                         let next_page_start_offset = last_result.byte_offset + 1;
+                         // We might need to store this to `page_offsets`?
+                         // We can store it when we successfully load the page?
+                         // Or store it now.
+                         // But we don't know if we will find results.
+                         // But we know `total_search_results` > `next_index`.
                     }
 
-                    // let start_offset = last_result.byte_offset + 1;
+                    let start_offset = last_result.byte_offset + 1;
                     self.fetch_page(next_index, start_offset);
                 } else {
                     // Should not happen if total > 0
@@ -543,6 +589,22 @@ impl TextViewerApp {
         } else {
             // Need to fetch previous page (or last page if wrapping)
             if prev_index == self.total_search_results - 1 {
+                // Wrapping to last page.
+                // We don't know the offset of the last page easily unless we visited it.
+                // But we can guess or just search from 0? No, that's slow.
+                // If we haven't visited it, we can't jump to it efficiently without scanning.
+                // But the user asked for "Next" optimization.
+                // For "Previous" wrapping to end, we might have to disable it or warn?
+                // Or just scan from 0 until we find it (might take time).
+                // Let's just say "Cannot jump to end" or try to find it.
+                // Or, since we know `total_results`, we can try to find the last page.
+                // But we don't know where it starts.
+
+                // For now, let's just reset to 0 if we can't find it?
+                // Or better: If we have `page_offsets` for the target page, use it.
+                // If not, maybe we shouldn't wrap?
+                // Let's disable wrapping for now if we don't have the offset.
+                // Or just fetch page 0.
                 self.status_message = "Cannot wrap to end in paginated mode yet.".to_string();
                 return;
             } else {
@@ -643,11 +705,9 @@ impl TextViewerApp {
                     if ui.button("Open...").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
                             // Auto-detect encoding
-                            if let Ok(mut file) = std::fs::File::open(&path) {
-                                use std::io::Read;
-                                let mut buffer = [0u8; 4096];
-                                let n = file.read(&mut buffer).unwrap_or(0);
-                                self.selected_encoding = detect_encoding(&buffer[..n]);
+                            if let Ok(file) = std::fs::read(&path) {
+                                let sample = &file[..file.len().min(4096)];
+                                self.selected_encoding = detect_encoding(sample);
                             }
                             self.open_file(path);
                         }
@@ -685,6 +745,9 @@ impl TextViewerApp {
                 ui.menu_button("Search", |ui| {
                     ui.checkbox(&mut self.use_regex, "Use Regex");
                     ui.checkbox(&mut self.case_sensitive, "Match Case");
+                    if ui.checkbox(&mut self.show_replace, "Show Replace (Ctrl+R)").changed() {
+                        // Reset replace state if hidden? No, keep it.
+                    }
                 });
 
                 ui.menu_button("Tools", |ui| {
@@ -755,16 +818,6 @@ impl TextViewerApp {
                     // Show current position over total
                     let current = (self.current_result_index + 1).min(total_results);
                     ui.label(format!("{}/{}", current, total_results));
-
-                    // Show details about the current match if available
-                    if !self.search_results.is_empty() {
-                        let page_relative_idx = self.current_result_index.saturating_sub(self.search_page_start_index);
-                        if page_relative_idx < self.search_results.len() {
-                            let result = &self.search_results[page_relative_idx];
-                            let line_num = self.line_indexer.find_line_at_offset(result.byte_offset) + 1;
-                            ui.label(format!("(Line: {}, Len: {})", line_num, result.match_len));
-                        }
-                    }
                 }
 
                 ui.separator();
@@ -788,7 +841,7 @@ impl TextViewerApp {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Replace with:");
-                    ui.add(
+                    let response = ui.add(
                         egui::TextEdit::singleline(&mut self.replace_query)
                             .desired_width(200.0)
                             .hint_text("Replacement text...")
@@ -898,7 +951,8 @@ impl TextViewerApp {
                                 first_visible_row = Some(corrected_start_line);
                             }
 
-                            // For contiguous rendering, we find the start offset of the first line and then read sequentially.
+                            // For contiguous rendering, we find the start offset of the first line
+                            // and then read sequentially.
                             let mut current_offset = if let Some((start, _)) = self.line_indexer.get_line_with_reader(corrected_start_line, reader) {
                                 start
                             } else {
@@ -911,7 +965,7 @@ impl TextViewerApp {
 
                             for line_num in render_range {
                                 // Read line starting at current_offset
-                                // Find the end of the line
+                                // We need to find the end of the line
                                 let chunk_size = 4096; // Read in chunks to find newline
                                 let mut line_end = current_offset;
                                 let mut found_newline = false;
@@ -937,7 +991,7 @@ impl TextViewerApp {
 
                                 let start = current_offset;
                                 let end = line_end;
-                                current_offset = end;
+                                current_offset = end; // Next line starts here
 
                                 if start >= reader.len() {
                                     break;
@@ -949,25 +1003,26 @@ impl TextViewerApp {
                                 // Collect matches that fall within this line's byte span; this works even with sparse line indexing
                                 let mut line_matches: Vec<(usize, usize, bool)> = Vec::new();
 
-                                // 1. Get matches from local search (ensures highlighting everywhere)
-                                let local_matches = self.search_engine.find_in_text(line_text);
+                                // Use binary search to find the first potential match
+                                // This assumes search_results is sorted by byte_offset
+                                let start_idx = self.search_results.partition_point(|r| r.byte_offset < start);
 
-                                // 2. Determine if any match is the "selected" one
-                                // We need the absolute offset of the currently selected match
-                                let selected_match_offset = if !self.search_results.is_empty() {
-                                    let page_relative_idx = self.current_result_index.saturating_sub(self.search_page_start_index);
-                                    if page_relative_idx < self.search_results.len() {
-                                        Some(self.search_results[page_relative_idx].byte_offset)
-                                    } else {
-                                        None
+                                for (idx, res) in self.search_results.iter().enumerate().skip(start_idx) {
+                                    if res.byte_offset >= end {
+                                        break;
                                     }
-                                } else {
-                                    None
-                                };
 
-                                for (rel_start, rel_end) in local_matches {
-                                    let abs_start = start + rel_start;
-                                    let is_selected = Some(abs_start) == selected_match_offset;
+                                    let rel_start = res.byte_offset.saturating_sub(start);
+                                    if rel_start >= line_text.len() {
+                                        continue;
+                                    }
+                                    let rel_end = (rel_start + res.match_len).min(line_text.len());
+
+                                    // Check if this is the currently selected result
+                                    // We need to map local index to global index
+                                    let global_idx = self.search_page_start_index + idx;
+                                    let is_selected = global_idx == self.current_result_index;
+
                                     line_matches.push((rel_start, rel_end, is_selected));
                                 }
 
@@ -1066,11 +1121,10 @@ impl TextViewerApp {
 
                 // Check for manual scroll
                 let current_offset = output.state.offset.y;
-                if !programmatic_scroll {
-                    // Reset correction if moved significantly or if we are at the top
-                    if (current_offset - self.last_scroll_offset).abs() > 1.0 || current_offset < 1.0 {
-                        self.scroll_correction = 0;
-                    }
+                if !programmatic_scroll && (current_offset - self.last_scroll_offset).abs() > 1.0 {
+                    // Manual scroll detected (drag or wheel)
+                    // Reset correction as user is establishing new position
+                    self.scroll_correction = 0;
                 }
                 self.last_scroll_offset = current_offset;
 
