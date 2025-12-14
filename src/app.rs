@@ -313,15 +313,6 @@ impl TextViewerApp {
                         // Add results
                         self.search_results.extend(chunk_result.matches);
                         new_results_added = true;
-
-                        // If we found results and haven't scrolled yet, scroll to the first one
-                        if !self.search_results.is_empty() && self.scroll_to_row.is_none() && self.current_result_index == 0 {
-                             // We need to sort at least once to find the true first result
-                             // But doing it here might be expensive if we do it often.
-                             // For the very first result, we can just check if we have any.
-                             // However, to be correct, we should probably wait or do a partial check.
-                             // For now, let's defer the sort to outside the loop.
-                        }
                     }
                     SearchMessage::Done(search_type) => {
                         match search_type {
@@ -507,49 +498,13 @@ impl TextViewerApp {
                 // We need the byte offset to start searching from.
                 // If we are just moving to the next page sequentially, we can use the last result's offset.
                 if let Some(last_result) = self.search_results.last() {
-                    // Start searching after the last result
-                    // We should probably store the start offset of the next page if we knew it?
-                    // But we don't. We just know we want the next 1000 results after the current last one.
-                    let start_offset = last_result.byte_offset + 1; // +1 or +match_len? Regex find resumes after match.
-                    // Actually, if we use `fetch_matches`, it uses `find_iter` which handles overlap.
-                    // But we need to give it a start position.
-                    // If we give `last_result.byte_offset + 1`, we might miss a match starting at `byte_offset + 1` if `match_len > 1`?
-                    // No, if we found a match at `byte_offset`, the next match must start after it (or overlapping if regex allows, but `find_iter` is non-overlapping).
-                    // So `byte_offset + match_len` is the correct resume point for `find_iter`.
-                    // But `fetch_matches` takes a `start_offset` and treats it as the beginning of the search.
+
 
                     // We should record the current page start offset before moving
                     if self.page_offsets.len() <= next_index / 1000 {
-                         // This logic assumes pages are always 1000.
-                         // But `search_results.len()` might be less if EOF.
-                         // If we are here, it means we have more results (total > current page end).
-                         // So we can assume we are fetching the next page.
-                         // We should store the offset for the *current* page if not stored.
-                         // But we want to store the offset for the *next* page so we can come back to it?
-                         // No, `page_offsets` stores the start offset of each page.
-                         // Page 0: 0.
-                         // Page 1: offset X.
-
-                         // When we loaded Page 0, we didn't push 0 to `page_offsets`. We should.
                          if self.page_offsets.is_empty() {
                              self.page_offsets.push(0);
                          }
-
-                         // Now we are moving to Page N+1.
-                         // The start offset for Page N+1 is `last_result.byte_offset + last_result.match_len`?
-                         // Or just `last_result.byte_offset + 1`?
-                         // Let's use `last_result.byte_offset + 1` to be safe, `find_iter` will skip if needed?
-                         // Actually `find_iter` starts at the beginning of the string.
-                         // If we pass a slice starting at `offset`, it finds matches in that slice.
-                         // So yes, `last_result.byte_offset + 1` is safe, but `last_result.byte_offset + last_result.match_len` is more correct for non-overlapping.
-                         // Let's use `last_result.byte_offset + 1` to be conservative.
-
-                         let next_page_start_offset = last_result.byte_offset + 1;
-                         // We might need to store this to `page_offsets`?
-                         // We can store it when we successfully load the page?
-                         // Or store it now.
-                         // But we don't know if we will find results.
-                         // But we know `total_search_results` > `next_index`.
                     }
 
                     let start_offset = last_result.byte_offset + 1;
@@ -589,22 +544,6 @@ impl TextViewerApp {
         } else {
             // Need to fetch previous page (or last page if wrapping)
             if prev_index == self.total_search_results - 1 {
-                // Wrapping to last page.
-                // We don't know the offset of the last page easily unless we visited it.
-                // But we can guess or just search from 0? No, that's slow.
-                // If we haven't visited it, we can't jump to it efficiently without scanning.
-                // But the user asked for "Next" optimization.
-                // For "Previous" wrapping to end, we might have to disable it or warn?
-                // Or just scan from 0 until we find it (might take time).
-                // Let's just say "Cannot jump to end" or try to find it.
-                // Or, since we know `total_results`, we can try to find the last page.
-                // But we don't know where it starts.
-
-                // For now, let's just reset to 0 if we can't find it?
-                // Or better: If we have `page_offsets` for the target page, use it.
-                // If not, maybe we shouldn't wrap?
-                // Let's disable wrapping for now if we don't have the offset.
-                // Or just fetch page 0.
                 self.status_message = "Cannot wrap to end in paginated mode yet.".to_string();
                 return;
             } else {
@@ -618,17 +557,7 @@ impl TextViewerApp {
                     self.fetch_page(target_page_start_index, offset);
                     self.current_result_index = prev_index;
                 } else {
-                    // We don't have the offset. This happens if we jumped around or haven't visited.
-                    // But we should have visited previous pages to get here?
-                    // Unless we jumped? We don't support jumping to arbitrary result index yet.
-                    // So we should have it.
-                    // But wait, `page_offsets` needs to be populated.
-                    // I'll ensure `fetch_page` populates it.
-
-                    // If we are at page 1 (1000-1999) and go back to 999 (page 0).
-                    // We should have `page_offsets[0]`.
-
-                    // Fallback: Search from 0?
+                    // Fallback: Search from 0
                     self.fetch_page(0, 0);
                     self.current_result_index = 0; // Reset to 0 if lost
                 }
@@ -651,10 +580,6 @@ impl TextViewerApp {
         if page_idx >= self.page_offsets.len() {
             if page_idx == self.page_offsets.len() {
                 self.page_offsets.push(start_offset);
-            } else {
-                // Gap in pages? Should not happen with sequential navigation.
-                // But if it does, we can't easily fill it.
-                // Just resize and fill with 0? No.
             }
         } else {
             // Update existing?
@@ -705,9 +630,11 @@ impl TextViewerApp {
                     if ui.button("Open...").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
                             // Auto-detect encoding
-                            if let Ok(file) = std::fs::read(&path) {
-                                let sample = &file[..file.len().min(4096)];
-                                self.selected_encoding = detect_encoding(sample);
+                            if let Ok(mut file) = std::fs::File::open(&path) {
+                                let mut buffer = [0; 4096];
+                                if let Ok(n) = std::io::Read::read(&mut file, &mut buffer) {
+                                    self.selected_encoding = detect_encoding(&buffer[..n]);
+                                }
                             }
                             self.open_file(path);
                         }
@@ -745,9 +672,6 @@ impl TextViewerApp {
                 ui.menu_button("Search", |ui| {
                     ui.checkbox(&mut self.use_regex, "Use Regex");
                     ui.checkbox(&mut self.case_sensitive, "Match Case");
-                    if ui.checkbox(&mut self.show_replace, "Show Replace (Ctrl+R)").changed() {
-                        // Reset replace state if hidden? No, keep it.
-                    }
                 });
 
                 ui.menu_button("Tools", |ui| {
@@ -841,7 +765,7 @@ impl TextViewerApp {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Replace with:");
-                    let response = ui.add(
+                    ui.add(
                         egui::TextEdit::singleline(&mut self.replace_query)
                             .desired_width(200.0)
                             .hint_text("Replacement text...")
@@ -1003,27 +927,19 @@ impl TextViewerApp {
                                 // Collect matches that fall within this line's byte span; this works even with sparse line indexing
                                 let mut line_matches: Vec<(usize, usize, bool)> = Vec::new();
 
-                                // Use binary search to find the first potential match
-                                // This assumes search_results is sorted by byte_offset
-                                let start_idx = self.search_results.partition_point(|r| r.byte_offset < start);
+                                // Determine the byte offset of the currently selected result
+                                let selected_offset = if self.total_search_results > 0 && self.current_result_index >= self.search_page_start_index {
+                                    let local_idx = self.current_result_index - self.search_page_start_index;
+                                    self.search_results.get(local_idx).map(|r| r.byte_offset)
+                                } else {
+                                    None
+                                };
 
-                                for (idx, res) in self.search_results.iter().enumerate().skip(start_idx) {
-                                    if res.byte_offset >= end {
-                                        break;
-                                    }
-
-                                    let rel_start = res.byte_offset.saturating_sub(start);
-                                    if rel_start >= line_text.len() {
-                                        continue;
-                                    }
-                                    let rel_end = (rel_start + res.match_len).min(line_text.len());
-
-                                    // Check if this is the currently selected result
-                                    // We need to map local index to global index
-                                    let global_idx = self.search_page_start_index + idx;
-                                    let is_selected = global_idx == self.current_result_index;
-
-                                    line_matches.push((rel_start, rel_end, is_selected));
+                                // Use find_in_text to find matches in the current line
+                                for (m_start, m_end) in self.search_engine.find_in_text(line_text) {
+                                    let abs_start = start + m_start;
+                                    let is_selected = Some(abs_start) == selected_offset;
+                                    line_matches.push((m_start, m_end, is_selected));
                                 }
 
                                 ui.horizontal(|ui| {
