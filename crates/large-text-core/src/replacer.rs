@@ -1,7 +1,7 @@
 use anyhow::Result;
 use regex::bytes::Regex;
-use std::fs::File;
-use std::io::{BufWriter, Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -18,6 +18,68 @@ pub enum ReplaceMessage {
 pub struct Replacer;
 
 impl Replacer {
+    pub fn replace_single(
+        file_path: &Path,
+        offset: usize,
+        old_len: usize,
+        new_text: &str,
+    ) -> Result<()> {
+        let new_bytes = new_text.as_bytes();
+
+        if new_bytes.len() == old_len {
+            // In-place optimization
+            let mut file = OpenOptions::new().write(true).open(file_path)?;
+            file.seek(SeekFrom::Start(offset as u64))?;
+            file.write_all(new_bytes)?;
+            return Ok(());
+        }
+
+        // Different length: rewrite file
+        let temp_path = file_path.with_extension("tmp");
+        {
+            let mut input_file = File::open(file_path)?;
+            let mut output_file = BufWriter::new(File::create(&temp_path)?);
+
+            // Copy before match
+            let mut buffer = vec![0u8; 8192];
+            let mut remaining = offset as u64;
+
+            while remaining > 0 {
+                let to_read = std::cmp::min(remaining, buffer.len() as u64) as usize;
+                let n = input_file.read(&mut buffer[0..to_read])?;
+                if n == 0 {
+                    break; // Unexpected EOF
+                }
+                output_file.write_all(&buffer[0..n])?;
+                remaining -= n as u64;
+            }
+
+            // Write replacement
+            output_file.write_all(new_bytes)?;
+
+            // Skip old match in input
+            input_file.seek(SeekFrom::Current(old_len as i64))?;
+
+            // Copy rest
+            std::io::copy(&mut input_file, &mut output_file)?;
+        }
+
+        // Replace original file
+        // On Windows, rename might fail if target exists.
+        if std::fs::rename(&temp_path, file_path).is_err() {
+            // Try to remove target and rename again.
+            if std::fs::remove_file(file_path).is_ok() {
+                std::fs::rename(&temp_path, file_path)?;
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Failed to replace file. It might be open by another process."
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn replace_all(
         input_path: &Path,
         output_path: &Path,
@@ -181,8 +243,8 @@ fn is_utf8_char_boundary(b: u8) -> bool {
 mod tests {
     use super::*;
     use std::io::Write;
-    use tempfile::NamedTempFile;
     use std::sync::mpsc;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_replace_all_simple() -> Result<()> {

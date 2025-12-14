@@ -39,6 +39,12 @@ pub enum SearchMessage {
     Error(String),
 }
 
+impl Default for SearchEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SearchEngine {
     pub fn new() -> Self {
         Self {
@@ -105,7 +111,7 @@ impl SearchEngine {
             .unwrap_or(1)
             .max(1);
 
-        let chunk_size = (file_len + num_threads - 1) / num_threads;
+        let chunk_size = file_len.div_ceil(num_threads);
         let query_len = self.query.len();
         let overlap = query_len.saturating_sub(1).max(1000);
 
@@ -260,15 +266,14 @@ impl SearchEngine {
                         results_found += 1;
                     }
 
-                    if !local_matches.is_empty() {
-                        if tx
+                    if !local_matches.is_empty()
+                        && tx
                             .send(SearchMessage::ChunkResult(ChunkSearchResult {
                                 matches: local_matches,
                             }))
                             .is_err()
-                        {
-                            return;
-                        }
+                    {
+                        return;
                     }
 
                     // Move to next chunk with overlap
@@ -298,10 +303,10 @@ impl SearchEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
     use crate::file_reader::detect_encoding;
+    use std::io::Write;
     use std::sync::mpsc;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_find_in_text() {
