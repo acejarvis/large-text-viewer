@@ -176,3 +176,84 @@ fn is_utf8_char_boundary(b: u8) -> bool {
     // i.e. it is < 0x80 or >= 0xC0.
     (b as i8) >= -0x40
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    use std::sync::mpsc;
+
+    #[test]
+    fn test_replace_all_simple() -> Result<()> {
+        let mut input = NamedTempFile::new()?;
+        write!(input, "Hello World, Hello Universe")?;
+        let input_path = input.path().to_path_buf();
+
+        let output = NamedTempFile::new()?;
+        let output_path = output.path().to_path_buf();
+
+        let (tx, rx) = mpsc::channel();
+        let cancel_token = Arc::new(AtomicBool::new(false));
+
+        Replacer::replace_all(
+            &input_path,
+            &output_path,
+            "Hello",
+            "Hi",
+            false,
+            tx,
+            cancel_token,
+        );
+
+        // Wait for done
+        loop {
+            match rx.recv() {
+                Ok(ReplaceMessage::Done) => break,
+                Ok(ReplaceMessage::Error(e)) => panic!("Error: {}", e),
+                Ok(ReplaceMessage::Progress(_, _)) => continue,
+                Err(_) => break,
+            }
+        }
+
+        let content = std::fs::read_to_string(&output_path)?;
+        assert_eq!(content, "Hi World, Hi Universe");
+        Ok(())
+    }
+
+    #[test]
+    fn test_replace_all_regex() -> Result<()> {
+        let mut input = NamedTempFile::new()?;
+        write!(input, "Item 1, Item 2, Item 3")?;
+        let input_path = input.path().to_path_buf();
+
+        let output = NamedTempFile::new()?;
+        let output_path = output.path().to_path_buf();
+
+        let (tx, rx) = mpsc::channel();
+        let cancel_token = Arc::new(AtomicBool::new(false));
+
+        Replacer::replace_all(
+            &input_path,
+            &output_path,
+            r"Item (\d)",
+            "Object $1",
+            true,
+            tx,
+            cancel_token,
+        );
+
+        loop {
+            match rx.recv() {
+                Ok(ReplaceMessage::Done) => break,
+                Ok(ReplaceMessage::Error(e)) => panic!("Error: {}", e),
+                Ok(ReplaceMessage::Progress(_, _)) => continue,
+                Err(_) => break,
+            }
+        }
+
+        let content = std::fs::read_to_string(&output_path)?;
+        assert_eq!(content, "Object 1, Object 2, Object 3");
+        Ok(())
+    }
+}

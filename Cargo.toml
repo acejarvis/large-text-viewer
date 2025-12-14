@@ -12,3 +12,6 @@ notify = "6.1"
 regex = "1.10"
 rfd = "0.15"
 anyhow = "1.0"
+
+[dev-dependencies]
+tempfile = "3.23.0"
