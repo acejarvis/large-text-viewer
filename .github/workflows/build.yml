@@ -69,20 +69,30 @@ jobs:
           echo "</pre>" >> $GITHUB_STEP_SUMMARY
           cat clippy_output.txt
           echo "failure=true" >> $GITHUB_OUTPUT
+        else
+          echo "## Clippy Check Passed :white_check_mark:" >> $GITHUB_STEP_SUMMARY
+          echo "No issues found. Great job!" >> $GITHUB_STEP_SUMMARY
+          echo "failure=false" >> $GITHUB_OUTPUT
         fi
 
     - name: Comment Clippy Results
-      if: matrix.os == 'windows-latest' && steps.clippy.outputs.failure == 'true' && github.event_name == 'pull_request'
+      if: matrix.os == 'windows-latest' && github.event_name == 'pull_request'
       uses: actions/github-script@v7
       with:
         script: |
+          const failure = '${{ steps.clippy.outputs.failure }}';
           const fs = require('fs');
           try {
-            const output = fs.readFileSync('clippy_output.txt', 'utf8');
-            const maxLength = 60000;
-            let body = '## Clippy Issues\n\n```\n' + output + '\n```';
-            if (body.length > maxLength) {
-               body = '## Clippy Issues\n\n```\n' + output.substring(0, maxLength) + '\n... (truncated)\n```';
+            let body;
+            if (failure === 'true') {
+              const output = fs.readFileSync('clippy_output.txt', 'utf8');
+              const maxLength = 60000;
+              body = '## Clippy Issues\n\n```\n' + output + '\n```';
+              if (body.length > maxLength) {
+                 body = '## Clippy Issues\n\n```\n' + output.substring(0, maxLength) + '\n... (truncated)\n```';
+              }
+            } else {
+              body = '## Clippy Check Passed :white_check_mark:\n\nGreat job! No issues found.';
             }
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
