@@ -80,6 +80,17 @@ pub struct TextViewerApp {
 
     // Focus control
     focus_search_input: bool,
+
+    // Unsaved changes
+    unsaved_changes: bool,
+    pending_replacements: Vec<PendingReplacement>,
+}
+
+#[derive(Clone)]
+struct PendingReplacement {
+    offset: usize,
+    old_len: usize,
+    new_text: String,
 }
 
 impl Default for TextViewerApp {
@@ -130,6 +141,8 @@ impl Default for TextViewerApp {
             scroll_correction: 0,
             pending_scroll_target: None,
             last_scroll_offset: 0.0,
+            unsaved_changes: false,
+            pending_replacements: Vec::new(),
         }
     }
 }
@@ -167,18 +180,17 @@ impl TextViewerApp {
             let (tx, rx) = channel();
             let path = reader.path().clone();
 
-            match notify::recommended_watcher(move |res: NotifyResult<notify::Event>| {
-                if let Ok(_event) = res {
-                    let _ = tx.send(());
-                }
-            }) {
-                Ok(mut watcher) => {
-                    if watcher.watch(&path, RecursiveMode::NonRecursive).is_ok() {
-                        self.watcher = Some(Box::new(watcher));
-                        self.file_change_rx = Some(rx);
+            if let Ok(mut watcher) =
+                notify::recommended_watcher(move |res: NotifyResult<notify::Event>| {
+                    if let Ok(_event) = res {
+                        let _ = tx.send(());
                     }
+                })
+            {
+                if watcher.watch(&path, RecursiveMode::NonRecursive).is_ok() {
+                    self.watcher = Some(Box::new(watcher));
+                    self.file_change_rx = Some(rx);
                 }
-                Err(_) => {}
             }
         }
     }
@@ -330,11 +342,12 @@ impl TextViewerApp {
                             SearchType::Fetch => self.search_fetch_done = true,
                         }
 
-                        if self.search_find_all && self.search_count_done {
-                            if self.search_results.len() == self.total_search_results {
-                                if let Some(token) = &self.search_cancellation_token {
-                                    token.store(true, Ordering::Relaxed);
-                                }
+                        if self.search_find_all
+                            && self.search_count_done
+                            && self.search_results.len() == self.total_search_results
+                        {
+                            if let Some(token) = &self.search_cancellation_token {
+                                token.store(true, Ordering::Relaxed);
                             }
                         }
                     }
@@ -446,6 +459,112 @@ impl TextViewerApp {
             self.replace_message_rx = None;
             self.replace_cancellation_token = None;
             self.replace_progress = None;
+        }
+    }
+
+    fn perform_single_replace(&mut self) {
+        if self.search_results.is_empty() {
+            return;
+        }
+
+        let local_index = if self.current_result_index >= self.search_page_start_index {
+            self.current_result_index - self.search_page_start_index
+        } else {
+            return;
+        };
+
+        if local_index >= self.search_results.len() {
+            return;
+        }
+
+        let match_info = self.search_results[local_index].clone();
+
+        // Queue the replacement
+        self.pending_replacements.push(PendingReplacement {
+            offset: match_info.byte_offset,
+            old_len: match_info.match_len,
+            new_text: self.replace_query.clone(),
+        });
+        self.unsaved_changes = true;
+        self.status_message = "Replacement pending. Save to apply changes.".to_string();
+    }
+
+    fn save_file(&mut self) {
+        let Some(ref reader) = self.file_reader else {
+            return;
+        };
+        let input_path = reader.path().clone();
+        let encoding = reader.encoding();
+
+        if let Some(output_path) = rfd::FileDialog::new()
+            .set_file_name(input_path.file_name().unwrap().to_string_lossy())
+            .save_file()
+        {
+            // If saving to the same file
+            if output_path == input_path {
+                // Apply pending replacements in-place if possible
+                // We need to close the reader first to release the lock
+                self.file_reader = None;
+
+                let mut success = true;
+                for replacement in &self.pending_replacements {
+                    if let Err(e) = Replacer::replace_single(
+                        &input_path,
+                        replacement.offset,
+                        replacement.old_len,
+                        &replacement.new_text,
+                    ) {
+                        self.status_message = format!("Error saving: {}", e);
+                        success = false;
+                        break;
+                    }
+                }
+
+                if success {
+                    self.pending_replacements.clear();
+                    self.unsaved_changes = false;
+                    self.status_message = "File saved successfully".to_string();
+                }
+
+                // Re-open file
+                match FileReader::new(input_path.clone(), encoding) {
+                    Ok(reader) => {
+                        self.file_reader = Some(Arc::new(reader));
+                        self.line_indexer
+                            .index_file(self.file_reader.as_ref().unwrap());
+                        self.perform_search(self.search_find_all);
+                    }
+                    Err(e) => {
+                        self.status_message = format!("Error re-opening file: {}", e);
+                    }
+                }
+            } else {
+                // Saving to a different file
+                // Fallback: Copy file to output, then apply replacements in-place on the output file.
+                if std::fs::copy(&input_path, &output_path).is_ok() {
+                    let mut success = true;
+                    for replacement in &self.pending_replacements {
+                        if let Err(e) = Replacer::replace_single(
+                            &output_path,
+                            replacement.offset,
+                            replacement.old_len,
+                            &replacement.new_text,
+                        ) {
+                            self.status_message = format!("Error saving: {}", e);
+                            success = false;
+                            break;
+                        }
+                    }
+                    if success {
+                        self.pending_replacements.clear();
+                        self.unsaved_changes = false;
+                        self.status_message = "File saved successfully".to_string();
+                        self.open_file(output_path);
+                    }
+                } else {
+                    self.status_message = "Error copying file for save".to_string();
+                }
+            }
         }
     }
 
@@ -668,6 +787,14 @@ impl TextViewerApp {
                         ui.close_menu();
                     }
 
+                    if ui
+                        .add_enabled(self.unsaved_changes, egui::Button::new("Save (Ctrl+S)"))
+                        .clicked()
+                    {
+                        self.save_file();
+                        ui.close_menu();
+                    }
+
                     if ui.button("File Info").clicked() {
                         self.show_file_info = !self.show_file_info;
                         ui.close_menu();
@@ -835,8 +962,13 @@ impl TextViewerApp {
                         if let Some(progress) = self.replace_progress {
                             ui.label(format!("{:.1}%", progress * 100.0));
                         }
-                    } else if ui.button("Replace All").clicked() {
-                        self.perform_replace();
+                    } else {
+                        if ui.button("Replace").clicked() {
+                            self.perform_single_replace();
+                        }
+                        if ui.button("Replace All").clicked() {
+                            self.perform_replace();
+                        }
                     }
                 });
 
@@ -979,8 +1111,31 @@ impl TextViewerApp {
                                 break;
                             }
 
-                            let line_text = reader.get_chunk(start, end);
-                            let line_text = line_text.trim_end_matches('\n').trim_end_matches('\r');
+                            let mut line_text_owned = reader.get_chunk(start, end);
+
+                            // Apply pending replacements to the view
+                            for replacement in &self.pending_replacements {
+                                let rep_start = replacement.offset;
+                                let rep_end = rep_start + replacement.old_len;
+
+                                if rep_start >= start && rep_end <= end {
+                                    let rel_start = rep_start - start;
+                                    let rel_end = rep_end - start;
+
+                                    if line_text_owned.is_char_boundary(rel_start)
+                                        && line_text_owned.is_char_boundary(rel_end)
+                                    {
+                                        line_text_owned.replace_range(
+                                            rel_start..rel_end,
+                                            &replacement.new_text,
+                                        );
+                                    }
+                                }
+                            }
+
+                            let line_text = line_text_owned
+                                .trim_end_matches('\n')
+                                .trim_end_matches('\r');
 
                             // Collect matches that fall within this line's byte span; this works even with sparse line indexing
                             let mut line_matches: Vec<(usize, usize, bool)> = Vec::new();
@@ -1217,7 +1372,18 @@ impl TextViewerApp {
 
 impl eframe::App for TextViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Update window title
+        let title = if self.unsaved_changes {
+            "Large Text Viewer *"
+        } else {
+            "Large Text Viewer"
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.to_string()));
+
         // Handle keyboard shortcuts
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
+            self.save_file();
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::R)) {
             self.show_search_bar = true;
             self.show_replace = !self.show_replace;

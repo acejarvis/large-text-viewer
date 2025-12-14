@@ -49,6 +49,10 @@ impl FileReader {
         self.mmap.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.mmap.is_empty()
+    }
+
     pub fn path(&self) -> &PathBuf {
         &self.path
     }
@@ -122,7 +126,7 @@ mod tests {
         assert_eq!(reader.get_chunk(0, 5), "Hello");
         assert_eq!(reader.get_chunk(6, 11), "World");
         assert_eq!(reader.get_bytes(0, 5), b"Hello");
-        
+
         Ok(())
     }
 

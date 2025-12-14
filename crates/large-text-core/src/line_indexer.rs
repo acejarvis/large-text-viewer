@@ -10,6 +10,12 @@ pub struct LineIndexer {
     avg_line_length: f64,
 }
 
+impl Default for LineIndexer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LineIndexer {
     pub fn new() -> Self {
         Self {
@@ -179,8 +185,8 @@ impl LineIndexer {
         let mut line_end = scan_end;
         let search_from = relative_est.min(chunk.len());
 
-        for i in search_from..chunk.len() {
-            if chunk[i] == b'\n' {
+        for (i, &byte) in chunk.iter().enumerate().skip(search_from) {
+            if byte == b'\n' {
                 line_end = scan_start + i;
                 break;
             }
@@ -214,16 +220,16 @@ impl LineIndexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_reader::detect_encoding;
     use std::io::Write;
     use tempfile::NamedTempFile;
-    use crate::file_reader::detect_encoding;
 
     #[test]
     fn test_line_indexer_small_file() -> anyhow::Result<()> {
         let mut file = NamedTempFile::new()?;
         write!(file, "Line 1\nLine 2\nLine 3")?;
         let path = file.path().to_path_buf();
-        
+
         let reader = FileReader::new(path, detect_encoding(b""))?;
         let mut indexer = LineIndexer::new();
         indexer.index_file(&reader);
@@ -238,7 +244,7 @@ mod tests {
         let mut file = NamedTempFile::new()?;
         write!(file, "\n\n\n")?;
         let path = file.path().to_path_buf();
-        
+
         let reader = FileReader::new(path, detect_encoding(b""))?;
         let mut indexer = LineIndexer::new();
         indexer.index_file(&reader);
