@@ -705,9 +705,11 @@ impl TextViewerApp {
                     if ui.button("Open...").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
                             // Auto-detect encoding
-                            if let Ok(file) = std::fs::read(&path) {
-                                let sample = &file[..file.len().min(4096)];
-                                self.selected_encoding = detect_encoding(sample);
+                            if let Ok(mut file) = std::fs::File::open(&path) {
+                                use std::io::Read;
+                                let mut buffer = [0u8; 4096];
+                                let n = file.read(&mut buffer).unwrap_or(0);
+                                self.selected_encoding = detect_encoding(&buffer[..n]);
                             }
                             self.open_file(path);
                         }
