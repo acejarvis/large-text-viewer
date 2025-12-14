@@ -1781,6 +1781,7 @@ dependencies = [
  "encoding_rs",
  "memmap2",
  "regex",
+ "tempfile",
 ]
 
 [[package]]
@@ -1794,7 +1795,6 @@ dependencies = [
  "large-text-core",
  "notify",
  "rfd",
- "tempfile",
 ]
 
 [[package]]
