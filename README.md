@@ -1,6 +1,8 @@
 # High-Performance Large Text File Viewer in Rust
 **ECE1724 Rust Course Project Final Report**
 
+
+
 ## Team Information
 
 *   **Name**: Jarvis Wang
@@ -28,6 +30,7 @@ The primary objective of this project was to develop a high-performance GUI appl
 The project serves as both a standalone application (crate: [`large-text-viewer`](https://crates.io/crates/large-text-viewer)) and a proof-of-concept backend (crate: [`large-text-core`](https://crates.io/crates/large-text-core)) for a future extension to the Zed editor.
 
 ## Features
+![UI Screenshot](docs/UI_Screenshot.png)
 
 The final deliverable offers the following key features:
 
@@ -94,7 +97,6 @@ flowchart TD
     menu -->|open file| app
     menu -->|encoding select| app
     menu -->|search actions| app
-    menu -->|tail toggle| watcher
     menu -->|tail toggle| watcher
 ```
 
@@ -205,7 +207,7 @@ chmod +x scripts/generate_test_files.sh
 ```
 *Note: This script creates a few files of varying sizes for testing purposes.*
 
-Or just simple run the unit test:
+Or just simply run the unit test:
 ```bash
 cargo test --workspace
 ```
