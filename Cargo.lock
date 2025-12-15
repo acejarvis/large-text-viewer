@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "large-text-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "encoding_rs",
@@ -1786,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "large-text-viewer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "eframe",
