@@ -84,6 +84,10 @@ pub struct TextViewerApp {
     // Unsaved changes
     unsaved_changes: bool,
     pending_replacements: Vec<PendingReplacement>,
+
+    // Performance measurement
+    open_start_time: Option<std::time::Instant>,
+    search_count_start_time: Option<std::time::Instant>,
 }
 
 #[derive(Clone)]
@@ -143,12 +147,15 @@ impl Default for TextViewerApp {
             last_scroll_offset: 0.0,
             unsaved_changes: false,
             pending_replacements: Vec::new(),
+            open_start_time: None,
+            search_count_start_time: None,
         }
     }
 }
 
 impl TextViewerApp {
     fn open_file(&mut self, path: PathBuf) {
+        self.open_start_time = Some(std::time::Instant::now());
         match FileReader::new(path.clone(), self.selected_encoding) {
             Ok(reader) => {
                 self.file_reader = Some(Arc::new(reader));
@@ -268,6 +275,7 @@ impl TextViewerApp {
         };
 
         if find_all {
+            self.search_count_start_time = Some(std::time::Instant::now());
             // Start two tasks:
             // 1. Count all matches (parallel)
             // 2. Fetch first page of matches (sequential/chunked)
@@ -338,7 +346,18 @@ impl TextViewerApp {
                     }
                     SearchMessage::Done(search_type) => {
                         match search_type {
-                            SearchType::Count => self.search_count_done = true,
+                            SearchType::Count => {
+                                self.search_count_done = true;
+                                if let Some(start_time) = self.search_count_start_time {
+                                    let elapsed = start_time.elapsed();
+                                    println!("Search count completed in: {:.2?}", elapsed);
+                                    self.status_message = format!(
+                                        "{} (Counted in {:.2?})",
+                                        self.status_message, elapsed
+                                    );
+                                    self.search_count_start_time = None;
+                                }
+                            }
                             SearchType::Fetch => self.search_fetch_done = true,
                         }
 
@@ -1372,6 +1391,13 @@ impl TextViewerApp {
 
 impl eframe::App for TextViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(start_time) = self.open_start_time {
+            let elapsed = start_time.elapsed();
+            println!("File opened and first frame rendered in: {:.2?}", elapsed);
+            self.status_message = format!("{} (Rendered in {:.2?})", self.status_message, elapsed);
+            self.open_start_time = None;
+        }
+
         // Update window title
         let title = if self.unsaved_changes {
             "Large Text Viewer *"
