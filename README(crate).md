@@ -48,7 +48,7 @@ A cross-platform Rust GUI application for viewing and editing multi-GB text file
 
 - Lazy loading of file content and view point based rendering
 - Efficient line indexing (sample-based for very large files)
-- Web Workers for search operations
+- Multi-threading with `std::thread` for search operations
 - Chunked reading strategy
 - Cache visible content
 
